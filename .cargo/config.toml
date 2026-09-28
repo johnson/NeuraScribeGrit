@@ -1,0 +1,10 @@
+# Keep the differential suite hermetic.
+#
+# grit aborts the whole config cascade on a parse error in the user's global
+# `~/.gitconfig`, while git tolerates it. On this machine line 9 of that file
+# holds an escaped-quote value (`cmd = opendiff \"$LOCAL\" \"$REMOTE\"`),
+# which grit rejects. Pinning the global and system config to /dev/null keeps the
+# tests from depending on whatever the developer's config happens to contain.
+[env]
+GIT_CONFIG_GLOBAL = "/dev/null"
+GIT_CONFIG_SYSTEM = "/dev/null"

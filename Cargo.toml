@@ -1,0 +1,30 @@
+[package]
+name = "neurascribe-grit-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "C-ABI shim exposing grit-lib (Rust git) to the NeuraScribe Swift iOS/macOS app"
+publish = false
+
+[lib]
+name = "neurascribe_grit_ffi"
+# staticlib -> linked into the xcframework; rlib -> lets cargo test exercise the
+# same code the Swift side calls.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# grit-lib is MIT (verified in its Cargo.toml). Pinned to the commit this spike was
+# validated against; grit-git is GPL-2.0 and is deliberately NOT depended on.
+grit-lib = { git = "https://github.com/gitbutlerapp/grit", rev = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = "debuginfo"

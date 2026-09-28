@@ -1,0 +1,417 @@
+//! C-ABI surface for NeuraScribe, so the Swift app can drive grit-lib.
+//!
+//! Conventions:
+//! * every fallible call returns NULL (or a negative int) and leaves the reason
+//!   in a thread-local slot readable through `grit_last_error`;
+//! * strings returned as `*mut c_char` are owned by the caller and must be
+//!   released with `grit_string_free`;
+//! * structured results are JSON, which keeps the ABI small and stable while
+//!   the Swift side decodes into its own Codable types.
+
+pub mod ops;
+pub mod types;
+
+use std::cell::RefCell;
+use std::ffi::{c_char, CStr, CString};
+use std::path::Path;
+
+use grit_lib::repo::Repository;
+
+thread_local! {
+    static LAST_ERROR: RefCell<CString> =
+        RefCell::new(CString::new("").expect("empty string is valid"));
+}
+
+fn set_error(message: &str) {
+    let sanitized: String = message.chars().filter(|c| *c != '\0').take(4096).collect();
+    let value =
+        CString::new(sanitized).unwrap_or_else(|_| CString::new("error").expect("static literal"));
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = value);
+}
+
+/// Last error recorded on the calling thread. Never NULL; empty when no error
+/// has been recorded. Caller frees with `grit_string_free`.
+#[no_mangle]
+pub extern "C" fn grit_last_error() -> *mut c_char {
+    LAST_ERROR.with(|slot| slot.borrow().clone().into_raw())
+}
+
+/// Free a string returned by this library.
+#[no_mangle]
+pub unsafe extern "C" fn grit_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        drop(CString::from_raw(s));
+    }
+}
+
+fn out_string(value: String) -> *mut c_char {
+    match CString::new(value) {
+        Ok(s) => s.into_raw(),
+        Err(_) => {
+            set_error("string contained an interior NUL");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Borrow a C string argument as an owned `String`.
+unsafe fn take_str(p: *const c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    CStr::from_ptr(p).to_str().ok().map(str::to_string)
+}
+
+fn guard_string<F: FnOnce() -> anyhow::Result<String>>(f: F) -> *mut c_char {
+    match f() {
+        Ok(value) => out_string(value),
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn guard_json<F: FnOnce() -> anyhow::Result<serde_json::Value>>(f: F) -> *mut c_char {
+    guard_string(move || match f() {
+        Ok(value) => serde_json::to_string(&value).map_err(anyhow::Error::from),
+        Err(err) => Err(err),
+    })
+}
+
+fn guard_unit<F: FnOnce() -> anyhow::Result<()>>(f: F) -> i32 {
+    match f() {
+        Ok(()) => 0,
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            -1
+        }
+    }
+}
+
+/// Open a repository. Returns NULL when `path` is not inside a work tree.
+#[no_mangle]
+pub extern "C" fn grit_repo_open(path: *const c_char) -> *mut Repository {
+    let Some(path) = (unsafe { take_str(path) }) else {
+        set_error("null path");
+        return std::ptr::null_mut();
+    };
+    match ops::open(Path::new(&path)) {
+        Ok(repo) => Box::into_raw(Box::new(repo)),
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Release a handle from `grit_repo_open`.
+#[no_mangle]
+pub unsafe extern "C" fn grit_repo_free(repo: *mut Repository) {
+    if !repo.is_null() {
+        drop(Box::from_raw(repo));
+    }
+}
+
+/// 1 when `path` is inside a git work tree, 0 otherwise. Never errors.
+#[no_mangle]
+pub extern "C" fn grit_repo_exists(path: *const c_char) -> i32 {
+    match unsafe { take_str(path) } {
+        Some(path) if ops::exists(Path::new(&path)) => 1,
+        _ => 0,
+    }
+}
+
+/// Status JSON: {"branch":…,"has_changes":…,"files":[{"path":…,"status":…}]}.
+#[no_mangle]
+pub extern "C" fn grit_repo_status_json(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_json(|| Ok(serde_json::to_value(ops::status(repo)?)?))
+}
+
+#[no_mangle]
+pub extern "C" fn grit_repo_current_branch(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_string(|| ops::current_branch(repo))
+}
+
+/// HEAD commit sha, or NULL for an unborn branch (not an error).
+#[no_mangle]
+pub extern "C" fn grit_repo_head_sha(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    match ops::head_sha(repo) {
+        Some(sha) => out_string(sha),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Stage every non-ignored change. 0 on success, -1 on failure.
+#[no_mangle]
+pub extern "C" fn grit_repo_stage_all(repo: *mut Repository) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    guard_unit(|| ops::stage_all(repo))
+}
+
+/// Commit the index. Returns the new sha or NULL.
+#[no_mangle]
+pub extern "C" fn grit_repo_commit(
+    repo: *mut Repository,
+    message: *const c_char,
+    author_name: *const c_char,
+    author_email: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(message) = (unsafe { take_str(message) }) else {
+        set_error("null commit message");
+        return std::ptr::null_mut();
+    };
+    let name = unsafe { take_str(author_name) }.unwrap_or_else(|| "NeuraScribe".to_string());
+    let email =
+        unsafe { take_str(author_email) }.unwrap_or_else(|| "app@neurascribe.local".to_string());
+    guard_string(|| ops::commit(repo, &message, &name, &email))
+}
+
+/// Unified diff of one path, HEAD vs work tree.
+#[no_mangle]
+pub extern "C" fn grit_repo_diff_file(repo: *mut Repository, path: *const c_char) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(path) = (unsafe { take_str(path) }) else {
+        set_error("null path");
+        return std::ptr::null_mut();
+    };
+    guard_string(|| ops::diff_file(repo, &path))
+}
+
+/// Patches of a commit vs its parent, as JSON [{"path":…,"patch":…}].
+#[no_mangle]
+pub extern "C" fn grit_repo_diff_commit_json(repo: *mut Repository, sha: *const c_char) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(sha) = (unsafe { take_str(sha) }) else {
+        set_error("null sha");
+        return std::ptr::null_mut();
+    };
+    guard_json(|| Ok(serde_json::to_value(ops::diff_commit(repo, &sha)?)?))
+}
+
+/// Files differing between two commits, as JSON.
+#[no_mangle]
+pub extern "C" fn grit_repo_changed_files_json(
+    repo: *mut Repository,
+    base: *const c_char,
+    head: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let (base, head) = match (unsafe { take_str(base) }, unsafe { take_str(head) }) {
+        (Some(b), Some(h)) => (b, h),
+        _ => {
+            set_error("null base or head");
+            return std::ptr::null_mut();
+        }
+    };
+    guard_json(|| Ok(serde_json::to_value(ops::changed_files(repo, &base, &head)?)?))
+}
+
+/// Restore one path to its HEAD content.
+#[no_mangle]
+pub extern "C" fn grit_repo_reset_file_to_head(repo: *mut Repository, path: *const c_char) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(path) = (unsafe { take_str(path) }) else {
+        set_error("null path");
+        return -1;
+    };
+    guard_unit(|| ops::reset_file_to_head(repo, &path))
+}
+
+/// Hard reset to `sha`; returns the sha or NULL.
+#[no_mangle]
+pub extern "C" fn grit_repo_reset_hard_to(repo: *mut Repository, sha: *const c_char) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(sha) = (unsafe { take_str(sha) }) else {
+        set_error("null sha");
+        return std::ptr::null_mut();
+    };
+    guard_string(|| ops::reset_hard_to(repo, &sha))
+}
+
+/// Discard all work-tree changes; returns the restored HEAD sha or NULL.
+#[no_mangle]
+pub extern "C" fn grit_repo_force_checkout_head(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_string(|| ops::force_checkout_head(repo))
+}
+
+/// Remotes as JSON [{"name":…,"url":…}].
+#[no_mangle]
+pub extern "C" fn grit_repo_list_remotes_json(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_json(|| Ok(serde_json::to_value(ops::list_remotes(repo)?)?))
+}
+
+/// Commits HEAD is ahead of `remote_tip`; -1 on failure.
+#[no_mangle]
+pub extern "C" fn grit_repo_ahead_count(repo: *mut Repository, remote_tip: *const c_char) -> i64 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(tip) = (unsafe { take_str(remote_tip) }) else {
+        set_error("null remote tip");
+        return -1;
+    };
+    match ops::ahead_count(repo, &tip) {
+        Ok(n) => i64::from(n),
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            -1
+        }
+    }
+}
+
+/// 1 when `a` is an ancestor of `b`, 0 when not, -1 on failure.
+#[no_mangle]
+pub extern "C" fn grit_repo_is_ancestor(
+    repo: *mut Repository,
+    a: *const c_char,
+    b: *const c_char,
+) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let (a, b) = match (unsafe { take_str(a) }, unsafe { take_str(b) }) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            set_error("null commit");
+            return -1;
+        }
+    };
+    match ops::is_ancestor(repo, &a, &b) {
+        Ok(v) => i32::from(v),
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            -1
+        }
+    }
+}
+
+/// Best common ancestor; NULL when unrelated or on failure (check
+/// `grit_last_error` to tell them apart).
+#[no_mangle]
+pub extern "C" fn grit_repo_merge_base(
+    repo: *mut Repository,
+    a: *const c_char,
+    b: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let (a, b) = match (unsafe { take_str(a) }, unsafe { take_str(b) }) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            set_error("null commit");
+            return std::ptr::null_mut();
+        }
+    };
+    match ops::merge_base(repo, &a, &b) {
+        Ok(Some(sha)) => out_string(sha),
+        Ok(None) => std::ptr::null_mut(),
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Text of `path` at `sha`; NULL when absent or on failure.
+#[no_mangle]
+pub extern "C" fn grit_repo_blob_text(
+    repo: *mut Repository,
+    sha: *const c_char,
+    path: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let (sha, path) = match (unsafe { take_str(sha) }, unsafe { take_str(path) }) {
+        (Some(s), Some(p)) => (s, p),
+        _ => {
+            set_error("null sha or path");
+            return std::ptr::null_mut();
+        }
+    };
+    match ops::blob_text(repo, &sha, &path) {
+        Ok(Some(text)) => out_string(text),
+        Ok(None) => std::ptr::null_mut(),
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Absolute work-tree path; NULL for a bare repo or on failure.
+#[no_mangle]
+pub extern "C" fn grit_repo_work_tree(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    match &repo.work_tree {
+        Some(path) => out_string(path.to_string_lossy().to_string()),
+        None => std::ptr::null_mut(),
+    }
+}
