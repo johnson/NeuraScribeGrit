@@ -62,6 +62,11 @@ int32_t grit_repo_stage_all(GritRepoHandle *repo);
 char *grit_repo_commit(GritRepoHandle *repo, const char *message, const char *author_name, const char *author_email);
 char *grit_repo_diff_file(GritRepoHandle *repo, const char *path);
 char *grit_repo_diff_commit_json(GritRepoHandle *repo, const char *sha);
+/* Commits reachable from HEAD, newest first, by AUTHOR date (git
+ * --author-date-order). Returns JSON:
+ *   [{"hash":…,"author_time":…,"subject":…,"message":…}]
+ * author_time is epoch seconds. Free with grit_string_free. */
+char *grit_repo_log_json(GritRepoHandle *repo, size_t limit);
 char *grit_repo_changed_files_json(GritRepoHandle *repo, const char *base, const char *head);
 /* 0 on success, -1 on failure. */
 int32_t grit_repo_reset_file_to_head(GritRepoHandle *repo, const char *path);

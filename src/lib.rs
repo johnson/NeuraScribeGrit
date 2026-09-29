@@ -222,6 +222,19 @@ pub extern "C" fn grit_repo_diff_commit_json(repo: *mut Repository, sha: *const 
     guard_json(|| Ok(serde_json::to_value(ops::diff_commit(repo, &sha)?)?))
 }
 
+/// Commits reachable from HEAD as JSON: [{hash, author_time, subject, message}].
+///
+/// Ordered by AUTHOR time, newest first (see ops::log). `limit` is a hard
+/// maximum; a repository shorter than that returns everything it has.
+#[no_mangle]
+pub extern "C" fn grit_repo_log_json(repo: *mut Repository, limit: usize) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_json(|| Ok(serde_json::to_value(ops::log(repo, limit)?)?))
+}
 /// Files differing between two commits, as JSON.
 #[no_mangle]
 pub extern "C" fn grit_repo_changed_files_json(

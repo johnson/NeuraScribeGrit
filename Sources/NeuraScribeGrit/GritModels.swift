@@ -85,3 +85,40 @@ public struct GritCredential: Codable, Hashable, Sendable {
         return try? String(decoding: encoder.encode(self), as: UTF8.self)
     }
 }
+
+/// One commit, as the timeline needs it.
+///
+/// `date` is the **author** date, not the committer date. A rebase or an amend
+/// moves the committer date and leaves the author's alone, so for a timeline the
+/// committer date answers "when was this last touched on this machine" rather
+/// than "when was this written". Both platform backends here use author time so
+/// the two agree.
+public struct GritCommit: Identifiable, Hashable, Sendable {
+    public let hash: String
+    /// Author time.
+    public let date: Date
+    /// First paragraph of the message, joined onto one line (git's `%s`).
+    public let subject: String
+    /// Full message, subject line included.
+    public let body: String
+
+    public var id: String { hash }
+}
+
+extension GritCommit: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case hash
+        case authorTime = "author_time"
+        case subject
+        case message
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hash = try container.decode(String.self, forKey: .hash)
+        let seconds = try container.decode(TimeInterval.self, forKey: .authorTime)
+        date = Date(timeIntervalSince1970: seconds)
+        subject = try container.decode(String.self, forKey: .subject)
+        body = try container.decode(String.self, forKey: .message)
+    }
+}

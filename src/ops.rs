@@ -18,6 +18,7 @@ use grit_lib::merge_base::{count_symmetric_ahead_behind, is_ancestor as grit_is_
 use grit_lib::objects::{parse_commit, parse_tree, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
+use grit_lib::rev_list::{rev_list, OrderingMode, RevListOptions};
 use grit_lib::write_tree::write_tree_from_index;
 
 use crate::types::{FileDiff, FileStatus, RemoteInfo, StatusResult};
@@ -475,6 +476,98 @@ fn zero_oid() -> ObjectId {
     ObjectId::zero()
 }
 
+/// One commit as the app's timeline needs it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommitRecord {
+    pub hash: String,
+    /// Author timestamp, in seconds since the epoch.
+    ///
+    /// Author time, not committer time: this is what the timeline UI sorts and
+    /// filters on, and a rebase or amend moves the committer date while leaving
+    /// the author's intent where it was. See the alignment note in ops::log.
+    pub author_time: i64,
+    /// First line of the message, trimmed.
+    pub subject: String,
+    /// Full message, including the subject line.
+    pub message: String,
+}
+
+/// Commits reachable from HEAD, newest first, ordered by AUTHOR date.
+///
+/// `OrderingMode::AuthorDateWalk` is git's `--author-date-order`, so the
+/// traversal matches what `git log --author-date-order` would produce. The
+/// plain `Default` mode would order by committer date, which is the thing we
+/// are deliberately not using.
+///
+/// `limit` truncates AFTER the sort, so the caller gets the newest `limit`
+/// commits rather than the first `limit` walked.
+pub fn log(repo: &Repository, limit: usize) -> Result<Vec<CommitRecord>> {
+    let options = RevListOptions {
+        ordering: OrderingMode::AuthorDateWalk,
+        ..Default::default()
+    };
+    let result = rev_list(repo, &["HEAD".to_string()], &[], &options)?;
+
+    let mut commits = Vec::with_capacity(result.commits.len());
+    for oid in &result.commits {
+        let object = repo.odb.read(oid)?;
+        if object.kind != ObjectKind::Commit {
+            continue;
+        }
+        let data = parse_commit(&object.data)?;
+        commits.push(CommitRecord {
+            hash: oid.to_string(),
+            author_time: identity_time(&data),
+            subject: subject_of(&data.message),
+            message: data.message.clone(),
+        });
+    }
+
+    // rev_list already returned author-date order, but sorting again makes the
+    // guarantee ours rather than the caller's, and keeps the Swift side from
+    // having to re-sort the whole history. Stable, so commits sharing an author
+    // timestamp keep walk order instead of shuffling between calls.
+    commits.sort_by(|a, b| b.author_time.cmp(&a.author_time));
+    // 0 means "no cap": the Swift side filters the range itself and passes 0
+    // when it does not know how many commits are in scope. truncate(0) would
+    // silently empty the result, so treat it as unlimited rather than literal.
+    if limit > 0 {
+        commits.truncate(limit);
+    }
+    Ok(commits)
+}
+
+/// The epoch seconds in an identity line: `Name <email> 1700000000 +0800`.
+///
+/// The timestamp is the second-to-last whitespace-separated field. Returns 0
+/// when the line is too short to carry one, which sorts the commit last rather
+/// than failing the whole walk.
+fn identity_time(data: &CommitData) -> i64 {
+    let raw = String::from_utf8_lossy(&data.author_raw);
+    let fields: Vec<&str> = raw.split_whitespace().collect();
+    if fields.len() < 2 {
+        return 0;
+    }
+    fields[fields.len() - 2].parse().unwrap_or(0)
+}
+
+/// The subject line: the first paragraph of the message, up to the first blank
+/// line, joined with single spaces.
+///
+/// This is git's own definition of `%s` — a commit whose message wraps across
+/// three lines still has one subject, and callers that only want a title should
+/// not have to re-derive that.
+fn subject_of(message: &str) -> String {
+    let first_paragraph: Vec<&str> = message
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    first_paragraph
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 fn commit_tree(repo: &Repository, sha: &str) -> Result<ObjectId> {
     let oid: ObjectId = sha.parse().with_context(|| format!("bad commit {sha}"))?;
     let object = repo.odb.read(&oid)?;

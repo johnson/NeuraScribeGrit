@@ -180,6 +180,34 @@ public final class GritRepository {
         try takeString { grit_repo_force_checkout_head(handle) }
     }
 
+    /// Commits reachable from HEAD, newest first by **author** date.
+    ///
+    /// The range is filtered here rather than in grit, because `since` / `until`
+    /// are author-time bounds and the shim only walks. `limit` is applied after
+    /// filtering, so a caller asking for "20 commits since Tuesday" gets 20
+    /// commits from Tuesday, not the first 20 walked and then thinned out.
+    ///
+    /// - Parameters:
+    ///   - limit: maximum number of commits to return.
+    ///   - since: drop commits authored before this instant.
+    ///   - until: drop commits authored after this instant.
+    public func log(limit: Int = 20, since: Date? = nil, until: Date? = nil) throws -> [GritCommit] {
+        // Ask for everything the walk finds, then filter, then cut. A capped
+        // walk would make `since` silently wrong whenever more than `limit`
+        // commits fall outside the window.
+        let walked = try decode([GritCommit].self) {
+            grit_repo_log_json(handle, 0)
+        }
+        return walked
+            .filter { commit in
+                if let since, commit.date < since { return false }
+                if let until, commit.date > until { return false }
+                return true
+            }
+            .prefix(max(limit, 1))
+            .map { $0 }
+    }
+
     // MARK: - C plumbing
 
     /// The raw handle, for the network entry points in `GritNetwork`.
