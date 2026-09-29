@@ -1,0 +1,7 @@
+# Cargo build output. On this machine the target dir is redirected off the
+# ExFAT volume (see below), but a plain clone on APFS still needs this.
+/target
+
+# macOS writes these on ExFAT volumes and they are not real files.
+._*
+.DS_Store
