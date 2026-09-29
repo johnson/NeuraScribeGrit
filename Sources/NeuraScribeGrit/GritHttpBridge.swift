@@ -46,6 +46,12 @@ public struct GritHttpBridge {
     /// A packfile for a large repository runs to hundreds of megabytes. The
     /// body reaches grit as one contiguous buffer because that is all the
     /// `HttpClient` trait takes, so there is no streaming path to fall back on.
+    ///
+    /// This is enforced by `Collector` *while* the body arrives, so the cap is a real
+    /// bound on peak memory rather than a measurement taken afterwards. The
+    /// shim itself holds the body roughly twice — once here, once in the
+    /// `Vec` grit takes ownership of — so the process needs headroom for about
+    /// twice this figure plus whatever grit needs to index the pack.
     public nonisolated(unsafe) static var maximumResponseBytes = 512 * 1024 * 1024
 
     public init() {}
@@ -78,7 +84,10 @@ public struct GritHttpBridge {
     /// and `error`, so this object must outlive the call. A +1 reference
     /// travels in the struct's `context` field and `release` consumes it.
     private final class Response {
-        let body: [UInt8]
+        /// Held as `Data` rather than `[UInt8]` so the body is not copied a second
+        /// time on its way to grit. A packfile runs to hundreds of megabytes,
+        /// and every full copy of one is memory this device may not have.
+        let body: Data
         /// NUL-terminated, so the pointer we hand out is a valid C string.
         ///
         /// Held as `[CChar]` rather than `CString` because `CString` is no
@@ -87,7 +96,7 @@ public struct GritHttpBridge {
         let finalURLBytes: [CChar]
         let errorBytes: [CChar]
 
-        init(body: [UInt8], finalURL: String?, error: String?) {
+        init(body: Data, finalURL: String?, error: String?) {
             self.body = body
             self.finalURLBytes = finalURL.flatMap(Self.nulTerminated) ?? []
             self.errorBytes = error.flatMap(Self.nulTerminated) ?? []
@@ -149,20 +158,93 @@ public struct GritHttpBridge {
     /// queue while the caller reads it after the semaphore is signalled. The
     /// semaphore orders the two, but not formally, so the lock makes it correct
     /// rather than merely working.
-    private final class Slot {
+    /// Collects one response, chunk by chunk, and stops the transfer the moment
+    /// it would exceed the cap.
+    ///
+    /// `URLSession.dataTask(with:completionHandler:)` cannot do this. It hands back a
+    /// fully materialised `Data`, so a size check written against it runs *after* the whole
+    /// body has already been allocated. On device that is not a near miss: the
+    /// process is killed at its memory high-water mark inside CFNetwork's own
+    /// accumulation, before any of our code runs again, and the app dies with
+    /// no error at all.
+    ///
+    /// Receiving `didReceive data:` as it arrives is the only place a cap can bound anything. The
+    /// overflow check happens *before* the append, so the buffer never exceeds
+    /// the cap at all rather than exceeding it and then being measured.
+    private final class Collector: NSObject, URLSessionDataDelegate {
         private let lock = NSLock()
-        private var value: (status: Int32, data: Data?, url: String?, message: String?)?
+        private let limit: Int
+        private let semaphore = DispatchSemaphore(value: 0)
+        private var bytes = Data()
+        private var responseURL: String?
+        private var status: Int32 = 0
+        private var failure: String?
+        /// Set when the cap stopped the transfer, so the cancellation that
+        /// follows is not reported as the error instead of the real reason.
+        private var overflowed = false
 
-        func fill(_ new: (status: Int32, data: Data?, url: String?, message: String?)) {
-            lock.lock()
-            value = new
-            lock.unlock()
+        init(limit: Int) {
+            self.limit = limit
         }
 
-        var result: (status: Int32, data: Data?, url: String?, message: String?)? {
+        var data: Data? { failure == nil ? bytes : nil }
+        var finalURL: String? { responseURL }
+        var statusCode: Int32 { status }
+        var message: String? { failure }
+
+        /// Block the calling (non-main) thread until the transfer is done.
+        func wait() { semaphore.wait() }
+
+        /// What the user is told when a response is refused.
+        ///
+        /// Says "sync" rather than "fetch" because the same path serves a
+        /// push, and the size unit is formatted rather than assumed: the cap is
+        /// configurable, so a test-sized cap must not be reported as "0 MiB".
+        static func tooLarge(_ limit: Int) -> String {
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .binary
+            formatter.allowsNonnumericFormatting = false
+            let readable = formatter.string(fromByteCount: Int64(limit))
+            return "the server sent more than \(readable) in one response; " +
+                "this repository is too large to sync on this device"
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            lock.lock()
+            if let http = response as? HTTPURLResponse {
+                status = Int32(http.statusCode)
+            }
+            responseURL = response.url?.absoluteString
+            lock.unlock()
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
             lock.lock()
             defer { lock.unlock() }
-            return value
+            guard !overflowed else { return }
+            guard bytes.count <= limit - data.count else {
+                overflowed = true
+                failure = Self.tooLarge(limit)
+                dataTask.cancel()
+                return
+            }
+            bytes.append(data)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            lock.lock()
+            // A cancel we issued ourselves must not overwrite why we cancelled.
+            if failure == nil, let error {
+                failure = error.localizedDescription
+            }
+            lock.unlock()
+            semaphore.signal()
         }
     }
 
@@ -184,30 +266,18 @@ public struct GritHttpBridge {
             request.setValue(String(cString: gitProtocol), forHTTPHeaderField: "Git-Protocol")
         }
 
-        let slot = Slot()
-        let semaphore = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error {
-                slot.fill((0, nil, nil, error.localizedDescription))
-            } else if let http = response as? HTTPURLResponse {
-                slot.fill((Int32(http.statusCode), data, response?.url?.absoluteString, nil))
-            } else {
-                slot.fill((0, nil, nil, GritBridgeError.noResponse.localizedDescription))
-            }
-            semaphore.signal()
-        }
-        .resume()
-        semaphore.wait()
+        let collector = Collector(limit: Self.maximumResponseBytes)
+        let session = URLSession(configuration: .ephemeral, delegate: collector, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
 
-        guard let (status, data, url, message) = slot.result else {
+        session.dataTask(with: request).resume()
+        collector.wait()
+
+        if let message = collector.message { return failure(message) }
+        guard let data = collector.data else {
             return failure(GritBridgeError.noResponse.localizedDescription)
         }
-        if let message { return failure(message) }
-        guard let data else { return failure(GritBridgeError.noResponse.localizedDescription) }
-        guard data.count <= Self.maximumResponseBytes else {
-            return failure("the server sent \(data.count) bytes, over the \(Self.maximumResponseBytes)-byte limit")
-        }
-        return handBack(body: [UInt8](data), finalURL: url, error: nil, status: status)
+        return handBack(body: data, finalURL: collector.finalURL, error: nil, status: collector.statusCode)
     }
 
     // MARK: - Handoff
@@ -218,7 +288,7 @@ public struct GritHttpBridge {
     /// when this function returns, and grit calls `release` much later, so an
     /// unretained pointer would be a use-after-free on every single request.
     /// The +1 is balanced by the `release` handler.
-    private static func handBack(body: [UInt8], finalURL: String?, error: String?, status: Int32) -> GritHttpResponse {
+    private static func handBack(body: Data, finalURL: String?, error: String?, status: Int32) -> GritHttpResponse {
         let response = Response(body: body, finalURL: finalURL, error: error)
         let context = Unmanaged.passRetained(response).toOpaque()
         return response.body.withUnsafeBytes { bodyBuffer in
@@ -227,7 +297,7 @@ public struct GritHttpBridge {
                     build(
                         status: status,
                         body: bodyBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        bodyLen: body.count,
+                        bodyLen: response.body.count,
                         finalURL: finalURLBuffer.isEmpty ? nil : finalURLBuffer.baseAddress,
                         error: errorBuffer.isEmpty ? nil : errorBuffer.baseAddress,
                         context: context
@@ -260,7 +330,7 @@ public struct GritHttpBridge {
     }
 
     private static func failure(_ message: String) -> GritHttpResponse {
-        handBack(body: [], finalURL: nil, error: message, status: 0)
+        handBack(body: Data(), finalURL: nil, error: message, status: 0)
     }
 }
 
