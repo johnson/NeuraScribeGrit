@@ -12,7 +12,7 @@
 //! feature wires grit's own ureq-backed client instead. Both satisfy the same
 //! trait, so the operations are written once.
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -81,6 +81,10 @@ pub struct RawHttpResponse {
     pub final_url: *const c_char,
     /// Failure description, or NULL on success.
     pub error: *const c_char,
+    /// Opaque handle to whatever the embedder allocated, returned verbatim to
+    /// `release`. Swift needs this because it cannot recover its own object
+    /// from the body pointer without assuming something untrue about it.
+    pub context: *mut c_void,
 }
 
 /// `auth` carries a ready-made `Authorization` header value, or NULL. The
@@ -152,7 +156,7 @@ fn load_post() -> Option<RawPostFn> {
 /// `release` runs on every path, including the error path -- leaking Swift's
 /// buffers here would be a slow leak in a long-running app.
 fn copy_out(response: RawHttpResponse) -> std::result::Result<Copied, String> {
-    let RawHttpResponse { status, body, body_len, final_url, error } = response;
+    let RawHttpResponse { status, body, body_len, final_url, error, context } = response;
     let release: RawReleaseFn = unsafe { std::mem::transmute(RELEASE.load(Ordering::Acquire)) };
     let mut out = Copied { status, body: Vec::new(), final_url: None };
     let mut failure = None;
@@ -170,7 +174,7 @@ fn copy_out(response: RawHttpResponse) -> std::result::Result<Copied, String> {
                 out.final_url = Some(CStr::from_ptr(final_url).to_string_lossy().into_owned());
             }
         }
-        release(&mut RawHttpResponse { status, body, body_len, final_url, error });
+        release(&mut RawHttpResponse { status, body, body_len, final_url, error, context });
     }
 
     match failure {

@@ -1,7 +1,9 @@
-# Cargo build output. On this machine the target dir is redirected off the
-# ExFAT volume (see below), but a plain clone on APFS still needs this.
+# Build output. The xcframework is ~208 MB of build product; build it with
+# scripts/build-xcframework.sh rather than committing it.
 /target
+/.build
+/neurascribe_gritFFI.xcframework
 
-# macOS writes these on ExFAT volumes and they are not real files.
+# ExFAT (this repo lives on Store2T) mangles modes and litters AppleDouble files.
 ._*
 .DS_Store

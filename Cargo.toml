@@ -19,8 +19,12 @@ http-ureq = ["grit-lib/http-ureq"]
 
 [dependencies]
 # grit-lib is MIT (verified in its Cargo.toml). Pinned to the commit this spike was
-# validated against; grit-git is GPL-2.0 and is deliberately NOT depended on.
-grit-lib = { git = "https://github.com/gitbutlerapp/grit", rev = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07" }
+# validated against. a6828d5b carries the config backslash-escape fix, without which a
+# ~/.gitconfig using git's own opendiff idiom fails every config read — see
+# grit-lib/tests/config_escapes.rs. grit-git is GPL-2.0 and is deliberately NOT
+# depended on.
+grit-lib = { git = "https://github.com/johnson/grit", rev = "a6828d5b0512bc8304647632090b90ecea7524bb" }
+
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

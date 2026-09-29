@@ -1,0 +1,4 @@
+module neurascribe_gritFFI {
+    header "shim.h"
+    export *
+}
