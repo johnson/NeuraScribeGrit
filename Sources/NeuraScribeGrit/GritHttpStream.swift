@@ -52,6 +52,18 @@ final class GritHttpStreamBody: NSObject, URLSessionDataDelegate, @unchecked Sen
         // A nil delegate queue means URLSession makes a serial one for us, which
         // is what lets the delegate append without a second lock on the push side.
         let configuration = URLSessionConfiguration.ephemeral
+        // The default is 60s for the whole request, body included. A
+        // packfile over a phone link routinely runs past that, and the
+        // failure surfaces as URLError.timedOut with nothing in the
+        // message about a git problem. The resource timeout is the one
+        // that has to cover a large transfer, so it is raised well past
+        // any plausible fetch; the connection is not held open idle
+        // because waitsForConnectivity only covers the gap before it.
+        configuration.timeoutIntervalForRequest = 3600
+        configuration.timeoutIntervalForResource = 3600
+        configuration.waitsForConnectivity = true
+        configuration.allowsExpensiveNetworkAccess = true
+        configuration.allowsConstrainedNetworkAccess = true
         let session = URLSession(configuration: configuration, delegate: stream, delegateQueue: nil)
         stream.session = session
         let task = session.dataTask(with: request)
