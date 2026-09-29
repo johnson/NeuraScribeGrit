@@ -63,14 +63,18 @@ public struct GritHttpBridge {
         withUnsafePointer(to: Self.getHandler) { get in
             withUnsafePointer(to: Self.postHandler) { post in
                 withUnsafePointer(to: Self.releaseHandler) { release in
-                    GritHttpCallbacks(
-                        get: UnsafeMutableRawPointer(mutating: get)
-                            .assumingMemoryBound(to: GritHttpGetFn.self).pointee,
-                        post: UnsafeMutableRawPointer(mutating: post)
-                            .assumingMemoryBound(to: GritHttpPostFn.self).pointee,
-                        release: UnsafeMutableRawPointer(mutating: release)
-                            .assumingMemoryBound(to: GritHttpReleaseFn.self).pointee
-                    )
+                    withUnsafePointer(to: Self.streamOpenHandler) { streamPost in
+                        GritHttpCallbacks(
+                            get: UnsafeMutableRawPointer(mutating: get)
+                                .assumingMemoryBound(to: GritHttpGetFn.self).pointee,
+                            post: UnsafeMutableRawPointer(mutating: post)
+                                .assumingMemoryBound(to: GritHttpPostFn.self).pointee,
+                            stream_post: UnsafeMutableRawPointer(mutating: streamPost)
+                                .assumingMemoryBound(to: GritHttpStreamOpenFn.self).pointee,
+                            release: UnsafeMutableRawPointer(mutating: release)
+                                .assumingMemoryBound(to: GritHttpReleaseFn.self).pointee
+                        )
+                    }
                 }
             }
         }

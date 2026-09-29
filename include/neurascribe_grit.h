@@ -40,6 +40,59 @@ typedef GritHttpResponse (*GritHttpPostFn)(const char *url, const char *auth, co
                                           const char *git_protocol);
 typedef void (*GritHttpReleaseFn)(GritHttpResponse *response);
 
+/* A streaming POST. The embedder starts the request and hands back an opaque
+ * handle; grit pulls the body through read in whatever size chunks arrive.
+ *
+ * This exists because buffering the body is what a large fetch cannot afford:
+ * the whole packfile was resident in Swift, again in Rust, and again in the
+ * de-framed Vec before a single object was written. Nothing here changes what
+ * is on the wire, only when bytes are allowed to be held.
+ *
+ * Every hook takes the handle as its first argument, for the same reason
+ * GritProgressCallbacks carries a void *context: a C function pointer cannot
+ * capture, so the state has to arrive with the call. The handle is that
+ * state, and it is also what close is given to release it.
+ *
+ * read is called from a Rust thread and is expected to block until at least
+ * one byte is available or the body has ended. It returns 0 only at the end
+ * of the body; a stalled connection is its own business, and error is where
+ * the reason surfaces. */
+typedef struct GritHttpStreamOps {
+    /* The HTTP status, waiting for the response headers if they have not
+     * arrived yet. 0 when the request never completed. The status is reported
+     * separately rather than through the handle so the shim can run the same
+     * 401-retry dance it runs for the buffered verbs. */
+    int32_t (*status)(void *handle);
+    /* Up to cap bytes into buf. 0 means the body ended. */
+    size_t (*read)(void *handle, uint8_t *buf, size_t cap);
+    /* NULL on success, otherwise a message. Read it before close: close
+     * releases the handle and whatever the string was anchored to. */
+    const char *(*error)(void *handle);
+    /* Releases the handle. Mandatory: the caller has no other way to. */
+    void (*close)(void *handle);
+} GritHttpStreamOps;
+
+/* What a started request hands back: the body reader, and the object the
+ * hooks operate on.
+ *
+ * The ops travel from the embedder to the shim rather than the other way
+ * round, because a C function pointer cannot capture: the hooks have to be
+ * non-capturing, and non-capturing hooks need to be told which object they
+ * are acting on. That is what handle is for, and it is why every hook takes
+ * it as its first argument.
+ *
+ * An all-zero result means the request could not be started at all. */
+typedef struct GritHttpStream {
+    void *handle;
+    GritHttpStreamOps ops;
+} GritHttpStream;
+
+/* Starts the request and hands back the reader for its body. */
+typedef GritHttpStream (*GritHttpStreamOpenFn)(const char *url, const char *auth,
+                                                 const char *content_type, const char *accept,
+                                                 const uint8_t *body, size_t body_len,
+                                                 const char *git_protocol);
+
 /* The three verbs, handed to each network call as one struct.
  *
  * These used to be installed process-globally. grit takes its HttpClient as a
@@ -55,6 +108,10 @@ typedef void (*GritHttpReleaseFn)(GritHttpResponse *response);
 typedef struct GritHttpCallbacks {
     GritHttpGetFn get;
     GritHttpPostFn post;
+    /* The streaming form of post. Optional: when it is NULL the shim buffers
+     * through post instead, which is correct and what a caller with no use
+     * for streaming wants. Set it, and the packfile never has to be resident. */
+    GritHttpStreamOpenFn stream_post;
     GritHttpReleaseFn release;
 } GritHttpCallbacks;
 

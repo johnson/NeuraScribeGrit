@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use grit_lib::credentials::{Credential, CredentialProvider};
 use grit_lib::error::{Error, Result};
-use grit_lib::transport::http::HttpClient;
+use grit_lib::transport::http::{HttpBody, HttpClient};
 
 use crate::types::Credential as CredentialSpec;
 
@@ -105,6 +105,44 @@ type RawPostFn = extern "C" fn(
 ) -> RawHttpResponse;
 type RawReleaseFn = extern "C" fn(response: *mut RawHttpResponse);
 
+/// How grit pulls a response body out of a handle Swift owns.
+///
+/// Mirrors GritHttpStreamOps in the header. The handle is the context: a C
+/// function pointer cannot capture, so every hook takes the handle back as
+/// its first argument.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawStreamOps {
+    pub status: Option<extern "C" fn(handle: *mut c_void) -> i32>,
+    pub read: Option<extern "C" fn(handle: *mut c_void, buf: *mut u8, cap: usize) -> usize>,
+    pub error: Option<extern "C" fn(handle: *mut c_void) -> *const c_char>,
+    pub close: Option<extern "C" fn(handle: *mut c_void)>,
+}
+
+/// A started request: the body reader, and the object the hooks act on.
+///
+/// The hooks travel from the embedder to the shim, not the other way round.
+/// A C function pointer cannot capture, so the hooks are non-capturing and
+/// recover their object from the handle the shim hands back.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawStream {
+    pub handle: *mut c_void,
+    pub ops: RawStreamOps,
+}
+
+/// Starts a request and hands back the reader for its body. An all-zero
+/// result means it could not be started.
+type RawStreamOpenFn = extern "C" fn(
+    url: *const c_char,
+    auth: *const c_char,
+    content_type: *const c_char,
+    accept: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    git_protocol: *const c_char,
+) -> RawStream;
+
 /// The three Swift entry points, passed **per call**.
 ///
 /// They used to live in process-global atomics installed by
@@ -129,6 +167,10 @@ pub struct HttpCallbacks {
     pub post: Option<RawPostFn>,
     /// May be NULL only if `get` and `post` are too. `copy_out` requires it,
     /// because it is what frees the buffers Swift handed over.
+    /// The streaming form of post. NULL means the caller does not stream, and
+    /// post_streaming falls back to buffering through post -- which is exactly
+    /// grit's own default, so nothing has to be kept in step.
+    pub stream_post: Option<RawStreamOpenFn>,
     pub release: Option<RawReleaseFn>,
 }
 
@@ -136,7 +178,7 @@ impl HttpCallbacks {
     /// The set to use when the host build wires grit's own ureq client and the
     /// embedder has no Swift (the differential suite).
     pub fn none() -> Self {
-        Self { get: None, post: None, release: None }
+        Self { get: None, post: None, stream_post: None, release: None }
     }
 }
 
@@ -306,6 +348,126 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// A response body being pulled from Swift chunk by chunk.
+///
+/// This is the whole point of the streaming path: grit's reader asks for the
+/// next piece and Swift hands over only what has arrived, so neither side ever
+/// holds the packfile. The status and the 401 dance are settled before the
+/// body is handed to grit, because grit will not look at either once it has
+/// started consuming.
+pub struct StreamBody {
+    stream: RawStream,
+    /// Set once the body has been closed, so the drop path is idempotent.
+    closed: bool,
+}
+
+impl StreamBody {
+    /// The HTTP status, waiting for the response headers if they have not
+    /// arrived yet. 0 when the request never completed.
+    fn status(&self) -> i32 {
+        match self.stream.ops.status {
+            Some(f) => f(self.stream.handle),
+            None => 0,
+        }
+    }
+
+    /// Reject anything that is not a 2xx, reading the small error body so
+    /// the message says what the server said. The body is drained here and
+    /// nowhere else, so the good path never pays for it.
+    fn accepted(mut self, status: i32) -> Result<Self> {
+        if (200..300).contains(&status) {
+            return Ok(self);
+        }
+        let detail = self.drain();
+        self.close();
+        Err(Error::Message(if detail.is_empty() {
+            format!("HTTP {status} from the git server")
+        } else {
+            format!("HTTP {status} from the git server: {detail}")
+        }))
+    }
+
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        if let Some(close) = self.stream.ops.close {
+            close(self.stream.handle);
+        }
+    }
+
+    /// Read whatever Swift has, up to cap. Returns 0 only at the end of the
+    /// body; the handle is allowed to block until something arrives.
+    fn pull(&mut self, cap: usize) -> Result<Vec<u8>> {
+        let read = self
+            .stream
+            .ops
+            .read
+            .ok_or_else(|| {
+                Error::Message("the HTTP stream bridge supplied no read callback".into())
+            })?;
+        let mut buf = vec![0u8; cap];
+        let n = read(self.stream.handle, buf.as_mut_ptr(), cap);
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Drain the rest of the body into a string. Only used to turn a non-2xx
+    /// response into something worth showing; a 2xx body is never read this way.
+    fn drain(&mut self) -> String {
+        let mut all = Vec::new();
+        loop {
+            match self.pull(8 * 1024) {
+                Ok(chunk) if !chunk.is_empty() => all.extend_from_slice(&chunk),
+                _ => break,
+            }
+            if all.len() > 64 * 1024 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&all).trim().to_string()
+    }
+
+    /// What went wrong, if anything. Read before close: close frees whatever
+    /// the string was anchored to.
+    fn failure(&self) -> Option<String> {
+        let error = self.stream.ops.error?;
+        let raw = error(self.stream.handle);
+        if raw.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned())
+        }
+    }
+}
+
+// SAFETY: the handle is only ever touched between open and close, both of
+// which happen on the thread that made the call; the raw pointer is not
+// shared across threads, only moved.
+unsafe impl Send for StreamBody {}
+
+impl Drop for StreamBody {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl HttpBody for StreamBody {
+    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.closed {
+            return Ok(None);
+        }
+        let chunk = self.pull(64 * 1024)?;
+        if chunk.is_empty() {
+            if let Some(failure) = self.failure() {
+                return Err(Error::Message(failure));
+            }
+            return Ok(None);
+        }
+        Ok(Some(chunk))
+    }
+}
 impl HttpClient for CallbackHttpClient {
     fn get(&self, url: &str, git_protocol: Option<&str>) -> Result<Vec<u8>> {
         self.get_with_final_url(url, git_protocol).map(|(body, _)| body)
@@ -374,6 +536,110 @@ impl HttpClient for CallbackHttpClient {
             self.counters.add_received(bytes.len());
             Ok((copied, bytes))
         })
+    }
+    fn post_streaming(
+        &self,
+        url: &str,
+        content_type: &str,
+        accept: &str,
+        body: &[u8],
+        git_protocol: Option<&str>,
+    ) -> Result<Box<dyn HttpBody>> {
+        let open = match self.callbacks.stream_post {
+            Some(open) => open,
+            // No streaming handler: the inherited default buffers through post,
+            // which is what a caller with no use for streaming gets.
+            None => {
+                return HttpClient::post_streaming(
+                    self,
+                    url,
+                    content_type,
+                    accept,
+                    body,
+                    git_protocol,
+                )
+            }
+        };
+        let url_c = CString::new(url).map_err(|_| Error::Message("url contained a NUL".into()))?;
+        let ct = CString::new(content_type).unwrap_or_default();
+        let ac = CString::new(accept).unwrap_or_default();
+        let protocol = protocol_ptr(git_protocol).map_err(Error::Message)?;
+        let protocol_ptr = protocol.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        self.counters.add_sent(body.len());
+
+        let cached = self.auth_header.lock().ok().and_then(|slot| slot.clone());
+        let attempt = |auth: Option<&str>| -> Result<StreamBody> {
+            let auth_c = auth.map(CString::new).transpose().map_err(|e| Error::Message(e.to_string()))?;
+            let auth_ptr = auth_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+            let stream = open(
+                url_c.as_ptr(),
+                auth_ptr,
+                ct.as_ptr(),
+                ac.as_ptr(),
+                body.as_ptr(),
+                body.len(),
+                protocol_ptr,
+            );
+            if stream.handle.is_null() || stream.ops.read.is_none() || stream.ops.close.is_none() {
+                return Err(Error::Message(
+                    "the HTTP bridge could not start a streaming request".into(),
+                ));
+            }
+            Ok(StreamBody { stream, closed: false })
+        };
+
+        let mut stream = attempt(cached.as_deref())?;
+        let status = stream.status();
+        if status != 401 {
+            return Ok(Box::new(stream.accepted(status)?));
+        }
+
+        // A challenge means the body is an error page, not a pack. Drop it and
+        // go round once with a fresh credential, exactly as the buffered path
+        // does; grit never sees either body.
+        stream.close();
+        let (cred, header) = self.fresh_credential()?;
+        let stream = attempt(Some(&header))?;
+        let status = stream.status();
+        if status == 401 {
+            let _ = self.credentials.reject(&cred);
+            if let Ok(mut slot) = self.auth_header.lock() {
+                *slot = None;
+            }
+            return Err(Error::Auth("the supplied credentials were rejected".into()));
+        }
+        let _ = self.credentials.approve(&cred);
+        if let Ok(mut slot) = self.auth_header.lock() {
+            *slot = Some(header);
+        }
+        Ok(Box::new(stream.accepted(status)?))
+    }
+}
+
+
+impl CallbackHttpClient {
+    /// Ask the provider for a fresh credential after a challenge and build the
+    /// header from it. Shared with the buffered path so both fail the same way
+    /// when there is nothing to offer.
+    fn fresh_credential(&self) -> Result<(Credential, String)> {
+        let input = Credential {
+            protocol: Some("https".into()),
+            ..Default::default()
+        };
+        let cred = match self.credentials.fill(&input) {
+            Ok(c) if c.username.is_some() => c,
+            _ => {
+                return Err(Error::Auth(
+                    "no credential is available for this remote".to_string(),
+                ))
+            }
+        };
+        match basic_auth_header(&cred) {
+            Some(h) => Ok((cred, h)),
+            None => Err(Error::Auth(
+                "server asked for credentials but none were supplied".to_string(),
+            )),
+        }
     }
 }
 

@@ -32,6 +32,21 @@ serde_json = "1"
 [dev-dependencies]
 tempfile = "3"
 
+# The streaming fetch (option 2 of the pull-memory work) is not upstream yet:
+# a6828d5b's HttpClient::post returns a Vec, so a packfile is materialised in
+# Swift, again in Rust, and again after de-framing, before a single object is
+# written. This machine cannot reach github.com over git or HTTPS, so a pushed
+# fork branch is not available and the change cannot land upstream from here.
+#
+# A path override is the way to build against it. It is deliberately the only
+# thing pinning the shim to this checkout, and removing these eight lines
+# restores the pinned-upstream build the moment the change is upstream.
+#
+# The local tree is the same repository at the same commit plus commit
+# cf01b3394, on branch streaming-http.
+[patch."https://github.com/johnson/grit"]
+grit-lib = { path = "../grit/grit-lib" }
+
 [profile.release]
 opt-level = 2
 lto = true
