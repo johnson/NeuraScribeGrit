@@ -23,6 +23,14 @@ use std::path::Path;
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 
+/// The opaque repository handle, under the name the C header gives it.
+///
+/// Every `grit_repo_*` entry point takes and returns `*mut Repository`, but
+/// `use` alone does not make the type nameable from outside the crate, so Rust callers
+/// (and tests) could not spell a handle's type at all. Re-exporting it under
+/// the header's own name keeps the two sides reading the same.
+pub use grit_lib::repo::Repository as GritRepoHandle;
+
 thread_local! {
     static LAST_ERROR: RefCell<CString> =
         RefCell::new(CString::new("").expect("empty string is valid"));
@@ -584,9 +592,21 @@ pub extern "C" fn grit_repo_work_tree(repo: *mut Repository) -> *mut c_char {
 
 /// Optional credentials, as a JSON object `{"username":…,"password":…}`.
 /// A null pointer means "no credential".
-unsafe fn take_credential(json: *const c_char) -> Option<types::Credential> {
-    let raw = take_str(json)?;
-    serde_json::from_str(&raw).ok()
+///
+/// A pointer that is present but unreadable is an **error**, never an absent
+/// credential. Swallowing the parse failure here meant that a pointer to freed
+/// memory arrived as garbage, failed to parse, and became `None` — so
+/// a caller that had a perfectly good token in its hand was told, on the far
+/// side, that it had no credential at all. The error then read as "you never
+/// supplied a token" when the truth was "we lost the one you gave us".
+unsafe fn take_credential(json: *const c_char) -> std::result::Result<Option<types::Credential>, String> {
+    let Some(raw) = (unsafe { take_str(json) }) else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&raw) {
+        Ok(cred) => Ok(Some(cred)),
+        Err(err) => Err(format!("credential JSON is unreadable: {err}")),
+    }
 }
 
 
@@ -633,7 +653,13 @@ pub extern "C" fn grit_clone(
         }
     };
     let branch = unsafe { take_str(branch) };
-    let credential = unsafe { take_credential(credential) };
+    let credential = match unsafe { take_credential(credential) } {
+        Ok(c) => c,
+        Err(msg) => {
+            set_error(&msg);
+            return std::ptr::null_mut();
+        }
+    };
     guard_string(|| {
         net::clone(
             &url,
@@ -669,7 +695,13 @@ pub extern "C" fn grit_repo_fetch_json(
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
 
-    let credential = unsafe { take_credential(credential) };
+    let credential = match unsafe { take_credential(credential) } {
+        Ok(c) => c,
+        Err(msg) => {
+            set_error(&msg);
+            return std::ptr::null_mut();
+        }
+    };
     guard_json(move || {
         let result = net::fetch(
             &repo.git_dir,
@@ -706,7 +738,13 @@ pub extern "C" fn grit_repo_push_json(
             return std::ptr::null_mut();
         }
     };
-    let credential = unsafe { take_credential(credential) };
+    let credential = match unsafe { take_credential(credential) } {
+        Ok(c) => c,
+        Err(msg) => {
+            set_error(&msg);
+            return std::ptr::null_mut();
+        }
+    };
     let force = force != 0;
     guard_json(move || {
         let result = net::push(

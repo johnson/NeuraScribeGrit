@@ -43,6 +43,23 @@ public struct GritFetchResult: Decodable, Hashable, Sendable {
     }
 }
 
+/// Call `body` with a C string for `value`, or NULL when there is none.
+///
+/// `String.withCString` only guarantees the pointer for the duration of its own
+/// closure, so the call it feeds has to happen *inside* that closure. Binding the
+/// pointer to a `let` first and calling afterwards hands the C side a pointer to a
+/// temporary that is already gone.
+///
+/// That is not a theoretical hazard: it is exactly how the credential was being
+/// lost. `credential?.shimJSON?.withCString { UnsafePointer($0) }` compiled, the buffer
+/// usually survived by luck, and when it did not the shim read garbage, failed
+/// to parse it, and reported that the app had no credential at all — while the
+/// Keychain had handed it one two lines earlier.
+private func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+    guard let value else { return body(nil) }
+    return value.withCString { body($0) }
+}
+
 /// Network operations against a remote.
 public enum GritNetwork {
     /// Clone `url` into `destination` and return the branch that was checked out.
@@ -63,13 +80,15 @@ public enum GritNetwork {
             withUnsafePointer(to: progressCallbacks) { progress in
                 url.withCString { urlPointer in
                     destination.withCString { destPointer in
-                        let branchPointer = branch?.withCString { UnsafePointer($0) }
-                        let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                        return withUnsafePointer(to: http.callbacks) { callbacks in
-                            grit_clone(
-                                urlPointer, destPointer, branchPointer, credentialPointer,
-                                callbacks, progress
-                            )
+                        withOptionalCString(branch) { branchPointer in
+                            withOptionalCString(credential?.shimJSON) { credentialPointer in
+                                withUnsafePointer(to: http.callbacks) { callbacks in
+                                    grit_clone(
+                                        urlPointer, destPointer, branchPointer, credentialPointer,
+                                        callbacks, progress
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -96,12 +115,13 @@ public enum GritNetwork {
             withUnsafePointer(to: progressCallbacks) { progress in
                 url.withCString { urlPointer in
                     encoded.withCString { refspecPointer in
-                        let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                        return withUnsafePointer(to: http.callbacks) { callbacks in
-                            grit_repo_fetch_json(
-                                repository.rawHandle, urlPointer, refspecPointer,
-                                credentialPointer, callbacks, progress
-                            )
+                        withOptionalCString(credential?.shimJSON) { credentialPointer in
+                            withUnsafePointer(to: http.callbacks) { callbacks in
+                                grit_repo_fetch_json(
+                                    repository.rawHandle, urlPointer, refspecPointer,
+                                    credentialPointer, callbacks, progress
+                                )
+                            }
                         }
                     }
                 }
@@ -124,17 +144,18 @@ public enum GritNetwork {
             withUnsafePointer(to: progressCallbacks) { progress in
                 url.withCString { urlPointer in
                     branch.withCString { branchPointer in
-                        let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                        return withUnsafePointer(to: http.callbacks) { callbacks in
-                            grit_repo_push_json(
-                                repository.rawHandle,
-                                urlPointer,
-                                branchPointer,
-                                force ? 1 : 0,
-                                credentialPointer,
-                                callbacks,
-                                progress
-                            )
+                        withOptionalCString(credential?.shimJSON) { credentialPointer in
+                            withUnsafePointer(to: http.callbacks) { callbacks in
+                                grit_repo_push_json(
+                                    repository.rawHandle,
+                                    urlPointer,
+                                    branchPointer,
+                                    force ? 1 : 0,
+                                    credentialPointer,
+                                    callbacks,
+                                    progress
+                                )
+                            }
                         }
                     }
                 }
