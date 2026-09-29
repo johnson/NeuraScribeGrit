@@ -68,6 +68,21 @@ char *grit_repo_diff_commit_json(GritRepoHandle *repo, const char *sha);
  * author_time is epoch seconds. Free with grit_string_free. */
 char *grit_repo_log_json(GritRepoHandle *repo, size_t limit);
 char *grit_repo_changed_files_json(GritRepoHandle *repo, const char *base, const char *head);
+/* Resolve a ref name (or a raw SHA) to a commit SHA, as a JSON string.
+ * Reads packed-refs as well as loose refs. Free with grit_string_free. */
+char *grit_repo_resolve_ref(GritRepoHandle *repo, const char *refname);
+
+/* Every tracked path at a commit, as a JSON array of repo-relative sorted
+ * paths (git ls-tree -r). Free with grit_string_free. */
+char *grit_repo_list_files_json(GritRepoHandle *repo, const char *sha);
+
+/* Stage one path, including recording a deletion (git add -- <path>).
+ * 0 on success, -1 on failure. */
+int32_t grit_repo_stage_file(GritRepoHandle *repo, const char *path);
+
+/* Fast-forward HEAD and the work tree to a commit; new HEAD as a JSON string.
+ * Fails when the histories have diverged. Free with grit_string_free. */
+char *grit_repo_fast_forward_json(GritRepoHandle *repo, const char *tip);
 /* 0 on success, -1 on failure. */
 int32_t grit_repo_reset_file_to_head(GritRepoHandle *repo, const char *path);
 char *grit_repo_reset_hard_to(GritRepoHandle *repo, const char *sha);

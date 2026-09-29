@@ -208,6 +208,45 @@ public final class GritRepository {
             .map { $0 }
     }
 
+    /// Resolve a ref name (or a raw SHA) to a commit SHA.
+    ///
+    /// Reads `packed-refs` as well as loose refs, so a ref that git packed
+    /// after a fetch still resolves.
+    public func resolveRef(_ name: String) throws -> String {
+        try decode(String.self) {
+            grit_repo_resolve_ref(handle, name)
+        }
+    }
+
+    /// Every tracked path at a commit, repo-relative and sorted.
+    ///
+    /// Recursive, so nested paths come back as full repo-relative paths.
+    public func listFiles(at sha: String) throws -> [String] {
+        try decode([String].self) {
+            grit_repo_list_files_json(handle, sha)
+        }
+    }
+
+    /// Stage a single path, recording a deletion when the file is gone.
+    public func stageFile(_ path: String) throws {
+        guard grit_repo_stage_file(handle, path) == 0 else {
+            throw GritError.lastFailed
+        }
+    }
+
+    /// Fast-forward HEAD and the work tree to a commit.
+    ///
+    /// - Throws: when the histories have diverged. This never merges; the pull
+    ///   coordinator decides up front whether a merge is needed, and merging
+    ///   here would take that decision away from it.
+    /// - Returns: the new HEAD SHA.
+    @discardableResult
+    public func fastForward(to tip: String) throws -> String {
+        try decode(String.self) {
+            grit_repo_fast_forward_json(handle, tip)
+        }
+    }
+
     // MARK: - C plumbing
 
     /// The raw handle, for the network entry points in `GritNetwork`.

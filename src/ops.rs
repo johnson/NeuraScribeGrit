@@ -304,6 +304,98 @@ pub fn force_checkout_head(repo: &Repository) -> Result<String> {
     reset_hard_to(repo, &sha)
 }
 
+/// Resolve a ref name (or a raw SHA) to a commit SHA.
+///
+/// `resolve_ref` already falls back to `packed-refs`, which is what the app's
+/// hand-rolled reader had to reimplement — and had to get subtly wrong for
+/// packed refs it had never seen on device.
+pub fn resolve_ref(repo: &Repository, refname: &str) -> Result<String> {
+    // A full SHA is not a ref; callers legitimately pass both.
+    if refname.len() == 40 && refname.chars().all(|c| c.is_ascii_hexdigit()) {
+        let oid: ObjectId = refname
+            .parse()
+            .with_context(|| format!("bad object id {refname}"))?;
+        // Confirm it exists, so callers never get a plausible-looking SHA for an
+        // object that is not there.
+        repo.odb.read(&oid)?;
+        return Ok(oid.to_string());
+    }
+    let oid = grit_lib::refs::resolve_ref(&repo.git_dir, refname)
+        .with_context(|| format!("cannot resolve {refname}"))?;
+    Ok(oid.to_string())
+}
+
+/// Every tracked path at `sha`, repo-relative and sorted. `git ls-tree -r`.
+pub fn list_files(repo: &Repository, sha: &str) -> Result<Vec<String>> {
+    let tree = commit_tree(repo, sha)?;
+    let mut paths: Vec<String> = flatten_tree(&repo.odb, tree)?
+        .into_iter()
+        .map(|(rel, _, _)| rel)
+        .collect();
+    // Sorted so callers get a stable order without re-sorting on every call.
+    paths.sort();
+    Ok(paths)
+}
+
+/// Stage a single path, recording a deletion when the file is gone.
+///
+/// `git add -- <path>`: the file may be modified, new, or removed, and all
+/// three have to reach the index or the commit records the wrong thing.
+pub fn stage_file(repo: &Repository, path: &str) -> Result<()> {
+    let work_tree = repo
+        .work_tree
+        .as_deref()
+        .context("bare repository has no work tree")?;
+    let full = work_tree.join(path);
+    let mut index = repo.load_index()?;
+
+    if !full.exists() {
+        index.remove(path.as_bytes());
+        return write_index_clean(repo, &mut index);
+    }
+
+    // Follow symlinks: git records the target as a blob, not the link itself.
+    let meta = fs::symlink_metadata(&full)?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(&full)?;
+        let blob = repo.odb.write(ObjectKind::Blob, target.to_string_lossy().as_bytes())?;
+        let mut entry = make_index_entry(path, 0o120000, blob, &meta);
+        entry.mode = 0o120000;
+        index.add_or_replace(entry);
+        return write_index_clean(repo, &mut index);
+    }
+
+    let mode = if meta.permissions().mode() & 0o111 != 0 {
+        MODE_EXECUTABLE
+    } else {
+        MODE_REGULAR
+    };
+    let data = fs::read(&full)?;
+    let oid = repo.odb.write(ObjectKind::Blob, &data)?;
+    index.add_or_replace(make_index_entry(path, mode, oid, &meta));
+    write_index_clean(repo, &mut index)
+}
+
+/// Fast-forward HEAD and the work tree to `tip`.
+///
+/// Fails rather than merging when the histories have diverged, which is what
+/// `git merge --ff-only` does and what the pull coordinator relies on: it
+/// decides up front whether a merge is needed, and a silent merge here would
+/// take that decision away from it.
+pub fn fast_forward_to(repo: &Repository, tip: &str) -> Result<String> {
+    let head = head_sha(repo).ok_or_else(|| anyhow!("HEAD does not point at a commit"))?;
+    if head == tip {
+        // Already there. Still rewrite the work tree: a pull that finds HEAD
+        // equal to the tip may still be syncing files an earlier merge left behind.
+        return reset_hard_to(repo, tip);
+    }
+    let head_oid: ObjectId = head.parse().context("bad HEAD sha")?;
+    let tip_oid: ObjectId = tip.parse().with_context(|| format!("bad commit {tip}"))?;
+    if !grit_is_ancestor(&repo, head_oid, tip_oid)? {
+        bail!("not a fast-forward: {head} is not an ancestor of {tip}");
+    }
+    reset_hard_to(repo, tip)
+}
 /// Configured remotes with their fetch URLs, read from `.git/config`.
 pub fn list_remotes(repo: &Repository) -> Result<Vec<RemoteInfo>> {
     let path = repo.git_dir.join("config");

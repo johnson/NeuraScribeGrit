@@ -235,6 +235,69 @@ pub extern "C" fn grit_repo_log_json(repo: *mut Repository, limit: usize) -> *mu
     let repo = unsafe { &*repo };
     guard_json(|| Ok(serde_json::to_value(ops::log(repo, limit)?)?))
 }
+/// Resolve a ref name (or a raw SHA) to a commit SHA, as JSON string.
+/// Frees the repo's ability to read packed-refs without the caller parsing it.
+#[no_mangle]
+pub extern "C" fn grit_repo_resolve_ref(repo: *mut Repository, refname: *const c_char) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(refname) = (unsafe { take_str(refname) }) else {
+        set_error("null refname");
+        return std::ptr::null_mut();
+    };
+    guard_json(|| Ok(serde_json::to_value(ops::resolve_ref(repo, &refname)?)?))
+}
+
+/// Every tracked path at a commit, as a JSON array of repo-relative paths.
+#[no_mangle]
+pub extern "C" fn grit_repo_list_files_json(repo: *mut Repository, sha: *const c_char) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(sha) = (unsafe { take_str(sha) }) else {
+        set_error("null sha");
+        return std::ptr::null_mut();
+    };
+    guard_json(|| Ok(serde_json::to_value(ops::list_files(repo, &sha)?)?))
+}
+
+/// Stage one path (git add -- <path>), including recording a deletion.
+/// 0 on success, -1 on failure.
+#[no_mangle]
+pub extern "C" fn grit_repo_stage_file(repo: *mut Repository, path: *const c_char) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(path) = (unsafe { take_str(path) }) else {
+        set_error("null path");
+        return -1;
+    };
+    guard_unit(|| ops::stage_file(repo, &path))
+}
+
+/// Fast-forward HEAD and the work tree to a commit; returns the new HEAD as a
+/// JSON string. Fails when the histories have diverged.
+#[no_mangle]
+pub extern "C" fn grit_repo_fast_forward_json(repo: *mut Repository, tip: *const c_char) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(tip) = (unsafe { take_str(tip) }) else {
+        set_error("null tip");
+        return std::ptr::null_mut();
+    };
+    guard_json(|| Ok(serde_json::to_value(ops::fast_forward_to(repo, &tip)?)?))
+}
+
 /// Files differing between two commits, as JSON.
 #[no_mangle]
 pub extern "C" fn grit_repo_changed_files_json(
