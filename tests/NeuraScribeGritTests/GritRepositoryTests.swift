@@ -142,4 +142,39 @@ struct GritRepositoryTests {
             _ = try GritRepository(path: root.path)
         }
     }
+
+    @Test("a failure keeps its message when it is read on the main actor")
+    @MainActor
+    func errorMessageSurvivesTheHopToTheUI() async throws {
+        let root = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Mirrors GitService.resetHardWithGrit and the catch that follows it in
+        // the view: the grit call runs inside a detached task, and the error is
+        // caught and rendered on another thread afterwards. The shim records the
+        // reason in a thread-local, so a message read at render time looks at
+        // the wrong slot.
+        func failingReset(at path: String) async throws -> String {
+            try await Task.detached(priority: .userInitiated) { [path] in
+                let repo = try GritRepository(path: path)
+                return try repo.resetHard(to: String(repeating: "a", count: 40))
+            }.value
+        }
+
+        let description: String
+        do {
+            _ = try await failingReset(at: root.path)
+            Issue.record("expected the reset to fail")
+            description = ""
+        } catch {
+            description = error.localizedDescription
+        }
+
+        // The point is not the exact wording, it is that grit's words arrive
+        // at all. When the message was read lazily at render time, every grit
+        // failure reached the user as a fixed no-message string.
+        #expect(!description.isEmpty)
+        #expect(!description.contains("no message"),
+            "the message was lost across the thread hop: \(description)")
+    }
 }

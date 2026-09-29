@@ -34,6 +34,18 @@ fn set_error(message: &str) {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = value);
 }
 
+/// Forget whatever the previous call on this thread recorded.
+///
+/// Callers read the slot to tell a real failure from a NULL that means "nothing
+/// to report" (merge_base on unrelated commits does exactly that), so a message
+/// left over from an earlier failure would otherwise be attributed to a call
+/// that never set one. Every guarded entry point clears before it runs.
+fn clear_error() {
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = CString::new("").expect("empty string is valid");
+    });
+}
+
 /// Last error recorded on the calling thread. Never NULL; empty when no error
 /// has been recorded. Caller frees with `grit_string_free`.
 #[no_mangle]
@@ -68,6 +80,7 @@ unsafe fn take_str(p: *const c_char) -> Option<String> {
 }
 
 fn guard_string<F: FnOnce() -> anyhow::Result<String>>(f: F) -> *mut c_char {
+    clear_error();
     match f() {
         Ok(value) => out_string(value),
         Err(err) => {
@@ -85,6 +98,7 @@ fn guard_json<F: FnOnce() -> anyhow::Result<serde_json::Value>>(f: F) -> *mut c_
 }
 
 fn guard_unit<F: FnOnce() -> anyhow::Result<()>>(f: F) -> i32 {
+    clear_error();
     match f() {
         Ok(()) => 0,
         Err(err) => {
@@ -101,6 +115,7 @@ pub extern "C" fn grit_repo_open(path: *const c_char) -> *mut Repository {
         set_error("null path");
         return std::ptr::null_mut();
     };
+    clear_error();
     match ops::open(Path::new(&path)) {
         Ok(repo) => Box::into_raw(Box::new(repo)),
         Err(err) => {

@@ -23,7 +23,7 @@ public final class GritRepository {
     /// - Parameter path: the `.git` directory or the working tree root.
     public init(path: String) throws {
         guard let handle = path.withCString({ grit_repo_open($0) }) else {
-            throw GritError.lastFailed
+            throw GritError.failure()
         }
         self.handle = handle
     }
@@ -57,7 +57,7 @@ public final class GritRepository {
     /// How far `remoteTip` is ahead of the local branch.
     public func aheadCount(comparedTo remoteTip: String) throws -> Int {
         let count = remoteTip.withCString { grit_repo_ahead_count(handle, $0) }
-        guard count >= 0 else { throw GritError.lastFailed }
+        guard count >= 0 else { throw GritError.failure() }
         return Int(count)
     }
 
@@ -69,7 +69,7 @@ public final class GritRepository {
         switch result {
         case 1: return true
         case 0: return false
-        default: throw GritError.lastFailed
+        default: throw GritError.failure()
         }
     }
 
@@ -81,7 +81,11 @@ public final class GritRepository {
         guard let raw else {
             // NULL is ambiguous here: unrelated commits and a real failure look
             // identical, and only the thread-local error slot separates them.
-            if let message = GritError.lastMessage() { throw GritError.lastFailed }
+            //
+            // Read right after the call, on this thread, and carried in the
+            // error — the shim clears the slot on entry, so a message here is
+            // this call's and not an earlier failure's.
+            if let message = GritError.lastMessage() { throw GritError.lastFailed(message) }
             return nil
         }
         defer { grit_string_free(raw) }
@@ -146,7 +150,7 @@ public final class GritRepository {
     /// Stage every change, deletions included.
     public func stageAll() throws {
         // 0 is success here and -1 is failure; the inverse reads as a bug.
-        guard grit_repo_stage_all(handle) == 0 else { throw GritError.lastFailed }
+        guard grit_repo_stage_all(handle) == 0 else { throw GritError.failure() }
     }
 
     /// Commit the staged changes and return the new commit id.
@@ -196,7 +200,7 @@ public final class GritRepository {
     /// Restore one file to its HEAD content, discarding local edits to it.
     public func restoreFile(_ path: String) throws {
         guard path.withCString({ grit_repo_reset_file_to_head(handle, $0) }) == 0 else {
-            throw GritError.lastFailed
+            throw GritError.failure()
         }
     }
 
@@ -262,7 +266,7 @@ public final class GritRepository {
     /// Stage a single path, recording a deletion when the file is gone.
     public func stageFile(_ path: String) throws {
         guard grit_repo_stage_file(handle, path) == 0 else {
-            throw GritError.lastFailed
+            throw GritError.failure()
         }
     }
 
@@ -308,14 +312,14 @@ public final class GritRepository {
                 }
             }
         }
-        guard ok == 0 else { throw GritError.lastFailed }
+        guard ok == 0 else { throw GritError.failure() }
     }
 
     /// Remove a submodule: registration, gitlink, work tree and the
     /// submodule's own repository under `.git/modules`.
     public func removeSubmodule(path: String) throws {
         let ok = path.withCString { grit_repo_remove_submodule(handle, $0) }
-        guard ok == 0 else { throw GritError.lastFailed }
+        guard ok == 0 else { throw GritError.failure() }
     }
 
     /// Check a submodule out at the commit the superproject records.
@@ -357,7 +361,7 @@ public final class GritRepository {
         let ok = directory.withCString {
             grit_repo_untrack_directory(handle, $0)
         }
-        guard ok >= 0 else { throw GritError.lastFailed }
+        guard ok >= 0 else { throw GritError.failure() }
         return Int(ok)
     }
     // MARK: - C plumbing
@@ -370,7 +374,7 @@ public final class GritRepository {
 
     /// Take ownership of a returned C string, freeing it either way.
     private func takeString(_ produce: () -> UnsafeMutablePointer<CChar>?) throws -> String {
-        guard let pointer = produce() else { throw GritError.lastFailed }
+        guard let pointer = produce() else { throw GritError.failure() }
         defer { grit_string_free(pointer) }
         return String(cString: pointer)
     }
@@ -380,7 +384,7 @@ public final class GritRepository {
         _ type: T.Type,
         _ produce: () -> UnsafeMutablePointer<CChar>?
     ) throws -> T {
-        guard let pointer = produce() else { throw GritError.lastFailed }
+        guard let pointer = produce() else { throw GritError.failure() }
         defer { grit_string_free(pointer) }
         do {
             return try JSONDecoder().decode(T.self, from: Data(String(cString: pointer).utf8))
@@ -392,18 +396,33 @@ public final class GritRepository {
 
 /// A failure from the grit backend.
 public enum GritError: LocalizedError {
-    /// The shim reported a failure; the detail came from `grit_last_error`.
-    case lastFailed
+    /// The shim reported a failure. The message is whatever `grit_last_error`
+    /// held *at the moment the call failed*, or nil when the shim recorded none.
+    ///
+    /// It is carried rather than looked up on demand on purpose. The shim keeps
+    /// it in a thread-local, and every call the app makes runs in a detached
+    /// task while the error is caught and rendered on the main actor — so
+    /// reading the slot at render time reads a thread that never failed, and
+    /// every grit error reached the user as a fixed no-message string.
+    case lastFailed(String?)
     /// The shim returned something that is not the JSON the Swift side expects.
     case malformedResponse(String)
 
     public var errorDescription: String? {
         switch self {
-        case .lastFailed:
-            GritError.lastMessage().map { detail in "grit: " + detail } ?? "grit reported a failure with no message"
+        case .lastFailed(let message):
+            message.map { detail in "grit: " + detail } ?? "grit reported a failure with no message"
         case .malformedResponse(let body):
             "grit returned something that is not the expected JSON: " + String(body.prefix(200))
         }
+    }
+
+    /// A failure, with the shim's own words for it.
+    ///
+    /// Call this *on the thread that made the failing call*. The thread-local it
+    /// reads belongs to that thread and to no other.
+    static func failure() -> GritError {
+        .lastFailed(lastMessage())
     }
 
     /// The error recorded on the calling thread, or nil when there is none.

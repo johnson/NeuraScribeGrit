@@ -152,13 +152,13 @@ public enum GritNetwork {
     // MARK: - C plumbing
 
     private static func take(_ raw: UnsafeMutablePointer<CChar>?) throws -> String {
-        guard let raw else { throw GritError.lastFailed }
+        guard let raw else { throw GritError.failure() }
         defer { grit_string_free(raw) }
         return String(cString: raw)
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, from raw: UnsafeMutablePointer<CChar>?) throws -> T {
-        guard let raw else { throw GritError.lastFailed }
+        guard let raw else { throw GritError.failure() }
         defer { grit_string_free(raw) }
         do {
             return try JSONDecoder().decode(T.self, from: Data(String(cString: raw).utf8))
