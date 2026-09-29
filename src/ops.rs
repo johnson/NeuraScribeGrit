@@ -62,28 +62,54 @@ pub fn status(repo: &Repository) -> Result<StatusResult> {
     };
     let model = grit_lib::porcelain::status::status(repo, &opts, &mut NullProgress)?;
 
-    let mut files: Vec<FileStatus> = Vec::new();
+    // Merge by path rather than concatenating and deduplicating. A path can be
+    // staged and then edited again in the working tree; git shows that as two
+    // columns and the app needs both halves, so the entry is one row carrying
+    // two flags. A BTreeMap also gives the sorted-by-path order for free.
+    let mut by_path: BTreeMap<String, FileStatus> = BTreeMap::new();
+
     for entry in &model.staged {
-        files.push(FileStatus {
-            path: entry.path().to_string(),
-            status: status_name(&entry.status).to_string(),
-        });
-    }
-    for entry in &model.unstaged {
-        let path = entry.path().to_string();
-        // A path already staged keeps its staged label; git shows two columns
-        // and the app only surfaces one.
-        if files.iter().any(|f| f.path == path) {
-            continue;
-        }
-        files.push(FileStatus { path, status: status_name(&entry.status).to_string() });
-    }
-    for path in &model.untracked {
-        files.push(FileStatus { path: path.clone(), status: "untracked".to_string() });
+        by_path
+            .entry(entry.path().to_string())
+            .or_insert_with(|| FileStatus {
+                path: entry.path().to_string(),
+                status: status_name(&entry.status).to_string(),
+                staged: false,
+                unstaged: false,
+            })
+            .staged = true;
     }
 
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files.dedup_by(|a, b| a.path == b.path);
+    for entry in &model.unstaged {
+        let path = entry.path().to_string();
+        let slot = by_path
+            .entry(path.clone())
+            .or_insert_with(|| FileStatus {
+                path,
+                status: status_name(&entry.status).to_string(),
+                staged: false,
+                unstaged: false,
+            });
+        slot.unstaged = true;
+        // Only take the kind from the work-tree side when nothing is staged:
+        // for a staged path, the staged kind is the one the next commit gets.
+        if !slot.staged {
+            slot.status = status_name(&entry.status).to_string();
+        }
+    }
+
+    for path in &model.untracked {
+        by_path
+            .entry(path.clone())
+            .or_insert_with(|| FileStatus {
+                path: path.clone(),
+                status: "untracked".to_string(),
+                staged: false,
+                unstaged: false,
+            });
+    }
+
+    let files: Vec<FileStatus> = by_path.into_values().collect();
 
     Ok(StatusResult {
         branch: current_branch(repo).unwrap_or_default(),
@@ -216,6 +242,8 @@ pub fn changed_files(repo: &Repository, base: &str, head: &str) -> Result<Vec<Fi
         .map(|e| FileStatus {
             path: e.path().to_string(),
             status: status_name(&e.status).to_string(),
+            staged: false,
+            unstaged: false,
         })
         .collect())
 }
@@ -480,6 +508,8 @@ pub fn unstaged_entries(repo: &Repository) -> Result<Vec<FileStatus>> {
         .map(|e| FileStatus {
             path: e.path().to_string(),
             status: status_name(&e.status).to_string(),
+            staged: false,
+            unstaged: false,
         })
         .collect())
 }
@@ -493,6 +523,8 @@ pub fn staged_entries(repo: &Repository) -> Result<Vec<FileStatus>> {
         .map(|e| FileStatus {
             path: e.path().to_string(),
             status: status_name(&e.status).to_string(),
+            staged: false,
+            unstaged: false,
         })
         .collect())
 }

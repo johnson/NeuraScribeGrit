@@ -101,8 +101,13 @@ public final class GritRepository {
     }
 
     /// Per-file change list between two commits.
-    public func changedFiles(from base: String, to head: String) throws -> [GritFileDiff] {
-        try decode([GritFileDiff].self) {
+    /// Paths and change kinds between two commits ("added", "modified", ...).
+    ///
+    /// Decodes `GritFileStatus`, not `GritFileDiff`: the shim reports the
+    /// change kind for this operation and no patch, and a `GritFileDiff` decode
+    /// fails on every call because its `patch` is non-optional.
+    public func changedFileStatuses(from base: String, to head: String) throws -> [GritFileStatus] {
+        try decode([GritFileStatus].self) {
             base.withCString { lhs in head.withCString { rhs in grit_repo_changed_files_json(handle, lhs, rhs) } }
         }
     }

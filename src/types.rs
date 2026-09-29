@@ -14,6 +14,14 @@ pub struct FileStatus {
     /// One of: `modified`, `added`, `deleted`, `untracked`, `renamed`, `copied`,
     /// `type_changed`, `unmerged`.
     pub status: String,
+    /// The index differs from HEAD, so the next commit will contain this path.
+    ///
+    /// git shows this and `unstaged` as two columns. Collapsing them into one
+    /// row loses the distinction the UI needs: a file that was staged and then
+    /// edited again has to appear as both staged and modified.
+    pub staged: bool,
+    /// The working tree differs from the index, so the change is not staged yet.
+    pub unstaged: bool,
 }
 
 /// Full working-tree status.

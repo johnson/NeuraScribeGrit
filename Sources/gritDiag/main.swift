@@ -27,7 +27,7 @@ struct GritDiag {
             if let head = try? repo.headSHA() {
                 report("mergeBase(head,head)") { try repo.mergeBase(of: head, and: head) ?? "nil" }
                 report("isAncestor(head,head)") { try repo.isAncestor(head, of: head).description }
-                report("changedFiles(head,head)") { try repo.changedFiles(from: head, to: head).description }
+                report("changedFileStatuses(head,head)") { try repo.changedFileStatuses(from: head, to: head).description }
                 report("blobText(a.md)") { try repo.text(of: "a.md", at: head) ?? "nil" }
                 report("diffCommit(head)") { try repo.diff(commit: head).description }
             }

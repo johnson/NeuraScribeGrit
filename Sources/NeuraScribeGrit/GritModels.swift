@@ -13,10 +13,18 @@ public struct GritFileStatus: Codable, Hashable, Sendable {
     /// One of `modified`, `added`, `deleted`, `untracked`, `renamed`,
     /// `copied`, `type_changed`, `unmerged`.
     public let status: String
+    /// The index differs from HEAD, so the next commit will contain this path.
+    public let staged: Bool
+    /// The working tree differs from the index, so the change is not staged.
+    ///
+    /// Both can be true at once — a staged file that was then edited again.
+    public let unstaged: Bool
 
-    public init(path: String, status: String) {
+    public init(path: String, status: String, staged: Bool = false, unstaged: Bool = false) {
         self.path = path
         self.status = status
+        self.staged = staged
+        self.unstaged = unstaged
     }
 }
 

@@ -141,4 +141,21 @@ struct GritLogTests {
         // rather than nothing.
         #expect(try repo.log(limit: 1, since: cutoff).count == 1)
     }
+    @Test("changed file statuses carry a kind, not a patch")
+    func changedFileStatusesDecode() throws {
+        let root = try makeRebasedFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let repo = try GritRepository(path: root.path)
+        let head = try repo.headSHA()
+        let base = try #require(try repo.log().last?.hash)
+
+        let statuses = try repo.changedFileStatuses(from: base, to: head)
+
+        // The shim sends {path, status}. Decoding these as file diffs instead
+        // fails on the missing patch, so this asserts the shape that is
+        // actually on the wire.
+        #expect(statuses.map(\.path).contains("main.md"))
+        #expect(statuses.allSatisfy { $0.status == "added" || $0.status == "modified" })
+    }
 }
