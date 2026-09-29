@@ -13,7 +13,6 @@
 //! trait, so the operations are written once.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use grit_lib::credentials::{Credential, CredentialProvider};
@@ -106,22 +105,39 @@ type RawPostFn = extern "C" fn(
 ) -> RawHttpResponse;
 type RawReleaseFn = extern "C" fn(response: *mut RawHttpResponse);
 
-static GET: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-static POST: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-static RELEASE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+/// The three Swift entry points, passed **per call**.
+///
+/// They used to live in process-global atomics installed by
+/// `grit_http_set_handlers`. That was a mistake with teeth: grit takes its
+/// `HttpClient` as a parameter to `http_fetch`/`push_http`, so nothing in grit
+/// ever wanted a global -- it was invented here, and it raced. Two overlapping
+/// network operations could have one of them clear the handlers while the other
+/// was mid-request, and because the three pointers were three *separate*
+/// atomics a reader could also observe a half-installed set. The result was a
+/// release callback invoked on freed Swift closure state, i.e. EXC_BAD_ACCESS
+/// inside `copy_out`.
+///
+/// Handing the triple in as one `#[repr(C)]` struct per call makes the whole set
+/// move atomically and removes the install/uninstall dance entirely.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HttpCallbacks {
+    /// May be NULL; the operation then fails with a clear message rather than
+    /// appearing to succeed having transferred nothing.
+    pub get: Option<RawGetFn>,
+    /// May be NULL, same rule.
+    pub post: Option<RawPostFn>,
+    /// May be NULL only if `get` and `post` are too. `copy_out` requires it,
+    /// because it is what frees the buffers Swift handed over.
+    pub release: Option<RawReleaseFn>,
+}
 
-/// Install Swift's HTTP bridge. Passing a null function pointer clears it,
-/// which makes the next network call fail loudly instead of silently doing
-/// nothing -- a missing handler must never look like a clean fetch.
-#[no_mangle]
-pub unsafe extern "C" fn grit_http_set_handlers(
-    get: Option<RawGetFn>,
-    post: Option<RawPostFn>,
-    release: Option<RawReleaseFn>,
-) {
-    GET.store(get.map_or(std::ptr::null_mut(), |f| f as *mut ()), Ordering::Release);
-    POST.store(post.map_or(std::ptr::null_mut(), |f| f as *mut ()), Ordering::Release);
-    RELEASE.store(release.map_or(std::ptr::null_mut(), |f| f as *mut ()), Ordering::Release);
+impl HttpCallbacks {
+    /// The set to use when the host build wires grit's own ureq client and the
+    /// embedder has no Swift (the differential suite).
+    pub fn none() -> Self {
+        Self { get: None, post: None, release: None }
+    }
 }
 
 /// A response after its buffers have been copied out and handed back.
@@ -131,33 +147,18 @@ struct Copied {
     final_url: Option<String>,
 }
 
-fn load_get() -> Option<RawGetFn> {
-    let p = GET.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        // SAFETY: a non-null pointer here was stored from a `RawGetFn`.
-        Some(unsafe { std::mem::transmute(p) })
-    }
-}
-
-fn load_post() -> Option<RawPostFn> {
-    let p = POST.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        // SAFETY: a non-null pointer here was stored from a `RawPostFn`.
-        Some(unsafe { std::mem::transmute(p) })
-    }
-}
-
 /// Copy a response out, then hand it straight back to Swift to free.
 ///
 /// `release` runs on every path, including the error path -- leaking Swift's
 /// buffers here would be a slow leak in a long-running app.
-fn copy_out(response: RawHttpResponse) -> std::result::Result<Copied, String> {
+fn copy_out(
+    response: RawHttpResponse,
+    release: Option<RawReleaseFn>,
+) -> std::result::Result<Copied, String> {
     let RawHttpResponse { status, body, body_len, final_url, error, context } = response;
-    let release: RawReleaseFn = unsafe { std::mem::transmute(RELEASE.load(Ordering::Acquire)) };
+    let release = release.ok_or_else(|| {
+        "the HTTP bridge supplied no release callback, so its buffers would leak".to_string()
+    })?;
     let mut out = Copied { status, body: Vec::new(), final_url: None };
     let mut failure = None;
 
@@ -198,6 +199,10 @@ fn protocol_ptr(value: Option<&str>) -> std::result::Result<Option<CString>, Str
 /// until the session completes. That is fine because git operations already run
 /// off the main thread, but it is why this must never sit on a UI path.
 pub struct CallbackHttpClient {
+    /// Copied in at construction. Reading the callbacks off a value already in
+    /// hand is what makes install/uninstall -- and the race it caused --
+    /// unnecessary.
+    callbacks: HttpCallbacks,
     credentials: Arc<dyn CredentialProvider + Send + Sync>,
     /// `Authorization` header cached from the last successful exchange, so the
     /// common case is one round trip rather than two.
@@ -206,8 +211,11 @@ pub struct CallbackHttpClient {
 
 impl CallbackHttpClient {
     /// Wrap a credential provider. The trait's `fill` is what answers a 401.
-    pub fn new(credentials: Arc<dyn CredentialProvider + Send + Sync>) -> Self {
-        Self { credentials, auth_header: Mutex::new(None) }
+    pub fn new(
+        callbacks: HttpCallbacks,
+        credentials: Arc<dyn CredentialProvider + Send + Sync>,
+    ) -> Self {
+        Self { callbacks, credentials, auth_header: Mutex::new(None) }
     }
 
     /// Do one request, retrying exactly once after a 401, the way git does.
@@ -304,8 +312,8 @@ impl HttpClient for CallbackHttpClient {
         url: &str,
         git_protocol: Option<&str>,
     ) -> Result<(Vec<u8>, Option<String>)> {
-        let get = load_get().ok_or_else(|| {
-            Error::Message("no HTTP handler installed; call grit_http_set_handlers first".into())
+        let get = self.callbacks.get.ok_or_else(|| {
+            Error::Message("no HTTP GET handler was supplied for this operation".into())
         })?;
         let url_c = CString::new(url).map_err(|_| Error::Message("url contained a NUL".into()))?;
         let protocol = protocol_ptr(git_protocol).map_err(Error::Message)?;
@@ -317,7 +325,7 @@ impl HttpClient for CallbackHttpClient {
                 .map_err(|e| e.to_string())?;
             let auth_ptr = auth_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
             let response = get(url_c.as_ptr(), auth_ptr, protocol_ptr);
-            let copied = copy_out(response)?;
+            let copied = copy_out(response, self.callbacks.release)?;
             let final_url = copied.final_url.clone();
             let body = copied.body.clone();
             Ok((copied, (body, final_url)))
@@ -332,8 +340,8 @@ impl HttpClient for CallbackHttpClient {
         body: &[u8],
         git_protocol: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let post = load_post().ok_or_else(|| {
-            Error::Message("no HTTP handler installed; call grit_http_set_handlers first".into())
+        let post = self.callbacks.post.ok_or_else(|| {
+            Error::Message("no HTTP POST handler was supplied for this operation".into())
         })?;
         let url_c = CString::new(url).map_err(|_| Error::Message("url contained a NUL".into()))?;
         let ct = CString::new(content_type).unwrap_or_default();
@@ -355,7 +363,7 @@ impl HttpClient for CallbackHttpClient {
                 body.len(),
                 protocol_ptr,
             );
-            let copied = copy_out(response)?;
+            let copied = copy_out(response, self.callbacks.release)?;
             let bytes = copied.body.clone();
             Ok((copied, bytes))
         })
@@ -393,6 +401,9 @@ pub fn client_for(cred: Option<&CredentialSpec>) -> Result<Arc<dyn HttpClient>> 
 
 /// The client the network operations run against, through Swift URLSession.
 #[cfg(not(feature = "http-ureq"))]
-pub fn client_for(cred: Option<&CredentialSpec>) -> Result<Arc<dyn HttpClient>> {
-    Ok(Arc::new(CallbackHttpClient::new(provider_for(cred))))
+pub fn client_for(
+    cred: Option<&CredentialSpec>,
+    callbacks: HttpCallbacks,
+) -> Result<Arc<dyn HttpClient>> {
+    Ok(Arc::new(CallbackHttpClient::new(callbacks, provider_for(cred))))
 }

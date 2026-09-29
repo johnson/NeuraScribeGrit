@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use grit_lib::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode};
+use grit_lib::transfer::{FetchOptions, FetchOutcome, PushOptions, PushRefSpec, TagMode};
 
 use crate::http;
 use crate::ops;
@@ -85,14 +85,80 @@ fn fetch_options(refspecs: Vec<String>) -> FetchOptions {
     }
 }
 
+impl FetchResult {
+    fn from_outcome(outcome: &FetchOutcome) -> Self {
+        let mut updated_refs = BTreeMap::new();
+        for update in &outcome.updates {
+            if let Some(oid) = &update.new_oid {
+                // Key by the ref that was actually written, not the remote one.
+                // The two differ whenever a refspec has a destination, and the
+                // caller goes on to read the local ref.
+                let key = update.local_ref.as_ref().unwrap_or(&update.remote_ref);
+                updated_refs.insert(key.clone(), oid.to_string());
+            }
+        }
+        FetchResult { updated_refs, default_branch: outcome.default_branch.clone() }
+    }
+}
+
+/// The git dir a local remote lives in, when `url` names one on disk.
+///
+/// Handles a plain path (`/srv/repo`, `../other`) and a `file://` URL. A
+/// `file://` URL with a host other than empty or localhost is rejected, because
+/// that is a remote file share and pretending it is local would read the wrong
+/// machine's disk.
+fn local_remote_path(url: &str) -> Option<std::path::PathBuf> {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        // The authority runs to the first slash, so `file:///p` has an empty
+        // host and `file://localhost/p` has `localhost`; both are local.
+        // `file://otherhost/p` is a share on another machine and must not be
+        // read off this one's disk.
+        let mut parts = rest.splitn(2, '/');
+        let host = parts.next().unwrap_or_default();
+        let path = parts.next()?;
+        if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+            return None;
+        }
+        // `path` lost the separator the split consumed; the result is always
+        // absolute.
+        return Some(std::path::PathBuf::from("/").join(path));
+    }
+    if trimmed.contains("://") {
+        return None;
+    }
+    if trimmed.starts_with("//") {
+        // scp-style `user@host:path`; never a local path.
+        return None;
+    }
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
 /// Fetch from `url` into the repository whose git dir is `git_dir`.
 pub fn fetch(
     git_dir: &Path,
     url: &str,
     refspecs: &[String],
     cred: Option<&Credential>,
+    callbacks: http::HttpCallbacks,
 ) -> Result<FetchResult> {
-    let client = http::client_for(cred)?;
+    // A local remote must not go through the HTTP bridge. URLSession has no
+    // file:// transport, so the request fails before it starts; and even if
+    // it did, it would be the wrong path -- git serves a local remote straight
+    // from the object database. grit already has that transport, so use it.
+    if let Some(remote_git_dir) = local_remote_path(url) {
+        let outcome = grit_lib::transfer::fetch_local(
+            git_dir,
+            &remote_git_dir,
+            &fetch_options(refspecs.to_vec()),
+        )
+        .with_context(|| format!("fetch from {} failed", remote_git_dir.display()))?;
+        return Ok(FetchResult::from_outcome(&outcome));
+    }
+
+    let client = http::client_for(cred, callbacks)?;
     let base = http_base_url(url);
     let outcome = grit_lib::transport::http::http_fetch(
         client.as_ref(),
@@ -103,13 +169,7 @@ pub fn fetch(
     )
     .with_context(|| format!("fetch from {base} failed"))?;
 
-    let mut updated_refs = BTreeMap::new();
-    for update in &outcome.updates {
-        if let Some(oid) = &update.new_oid {
-            updated_refs.insert(update.remote_ref.clone(), oid.to_string());
-        }
-    }
-    Ok(FetchResult { updated_refs, default_branch: outcome.default_branch.clone() })
+    Ok(FetchResult::from_outcome(&outcome))
 }
 
 /// Clone `url` into a fresh repository at `dest`, checking out `branch` or the
@@ -119,6 +179,7 @@ pub fn clone(
     dest: &Path,
     branch: Option<&str>,
     cred: Option<&Credential>,
+    callbacks: http::HttpCallbacks,
 ) -> Result<String> {
     if dest.exists() {
         bail!("clone target already exists: {}", dest.display());
@@ -131,7 +192,7 @@ pub fn clone(
     let base = http_base_url(url);
     write_remote(&repo.git_dir, "origin", &base)?;
 
-    let client = http::client_for(cred)?;
+    let client = http::client_for(cred, callbacks)?;
     // grit's fetch has no "fetch everything" mode -- an empty refspec list
     // writes nothing -- so the remote-tracking namespace is populated first
     // and the branch is created from it afterwards. `git clone` orders it
@@ -167,6 +228,7 @@ pub fn push(
     branch: &str,
     force: bool,
     cred: Option<&Credential>,
+    callbacks: http::HttpCallbacks,
 ) -> Result<PushResult> {
     let local_ref = format!("refs/heads/{branch}");
     let src: grit_lib::objects::ObjectId = grit_lib::refs::resolve_ref(git_dir, &local_ref)
@@ -186,7 +248,7 @@ pub fn push(
         push_options: Vec::new(),
     };
 
-    let client = http::client_for(cred)?;
+    let client = http::client_for(cred, callbacks)?;
     let base = http_base_url(url);
     let outcome = grit_lib::push::push_http(
         client.as_ref(),

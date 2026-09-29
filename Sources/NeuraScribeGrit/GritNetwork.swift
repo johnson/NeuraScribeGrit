@@ -57,13 +57,16 @@ public enum GritNetwork {
         url: String,
         to destination: String,
         branch: String? = nil,
-        credential: GritCredential? = nil
+        credential: GritCredential? = nil,
+        http: GritHttpBridge = GritHttpBridge()
     ) throws -> String {
         let raw = url.withCString { urlPointer in
             destination.withCString { destPointer in
                 let branchPointer = branch?.withCString { UnsafePointer($0) }
                 let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                return grit_clone(urlPointer, destPointer, branchPointer, credentialPointer)
+                return withUnsafePointer(to: http.callbacks) { callbacks in
+                    grit_clone(urlPointer, destPointer, branchPointer, credentialPointer, callbacks)
+                }
             }
         }
         return try take(raw)
@@ -78,13 +81,18 @@ public enum GritNetwork {
         repository: GritRepository,
         url: String,
         refspecs: [String],
-        credential: GritCredential? = nil
+        credential: GritCredential? = nil,
+        http: GritHttpBridge = GritHttpBridge()
     ) throws -> GritFetchResult {
         let encoded = (try? String(decoding: JSONEncoder().encode(refspecs), as: UTF8.self)) ?? "[]"
         let raw = url.withCString { urlPointer in
             encoded.withCString { refspecPointer in
                 let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                return grit_repo_fetch_json(repository.rawHandle, urlPointer, refspecPointer, credentialPointer)
+                return withUnsafePointer(to: http.callbacks) { callbacks in
+                    grit_repo_fetch_json(
+                        repository.rawHandle, urlPointer, refspecPointer, credentialPointer, callbacks
+                    )
+                }
             }
         }
         return try decode(GritFetchResult.self, from: raw)
@@ -96,18 +104,22 @@ public enum GritNetwork {
         url: String,
         branch: String,
         force: Bool = false,
-        credential: GritCredential? = nil
+        credential: GritCredential? = nil,
+        http: GritHttpBridge = GritHttpBridge()
     ) throws -> [GritPushResult] {
         let raw = url.withCString { urlPointer in
             branch.withCString { branchPointer in
                 let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                return grit_repo_push_json(
-                    repository.rawHandle,
-                    urlPointer,
-                    branchPointer,
-                    force ? 1 : 0,
-                    credentialPointer
-                )
+                return withUnsafePointer(to: http.callbacks) { callbacks in
+                    grit_repo_push_json(
+                        repository.rawHandle,
+                        urlPointer,
+                        branchPointer,
+                        force ? 1 : 0,
+                        credentialPointer,
+                        callbacks
+                    )
+                }
             }
         }
         // The shim wraps the per-ref results in an envelope; unwrap it here so

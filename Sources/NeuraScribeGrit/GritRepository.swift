@@ -166,6 +166,33 @@ public final class GritRepository {
         }
     }
 
+    /// Commit only `files`, the way `git commit -- <paths>` does.
+    ///
+    /// Everything else the user had staged stays staged. A file-picker UI hands
+    /// in a subset of the staged changes constantly, and committing the whole
+    /// index instead would sweep in work the user did not tick.
+    /// - Throws: `GritError` if none of `files` is actually staged.
+    public func commit(
+        message: String,
+        files: [String],
+        authorName: String? = nil,
+        authorEmail: String? = nil
+    ) throws -> String {
+        let encoded = try JSONEncoder().encode(files)
+        let json = String(decoding: encoded, as: UTF8.self)
+        return try message.withCString { text in
+            try (authorName ?? "NeuraScribe").withCString { name in
+                try (authorEmail ?? "app@neurascribe.local").withCString { email in
+                    try json.withCString { paths in
+                        try takeString {
+                            grit_repo_commit_only(handle, text, name, email, paths)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Restore one file to its HEAD content, discarding local edits to it.
     public func restoreFile(_ path: String) throws {
         guard path.withCString({ grit_repo_reset_file_to_head(handle, $0) }) == 0 else {

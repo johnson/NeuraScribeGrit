@@ -19,7 +19,7 @@ use grit_lib::objects::{parse_commit, parse_tree, serialize_commit, CommitData, 
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::rev_list::{rev_list, OrderingMode, RevListOptions};
-use grit_lib::write_tree::write_tree_from_index;
+use grit_lib::write_tree::{write_tree_from_index, write_tree_partial_from_index};
 
 use crate::types::{FileDiff, FileStatus, RemoteInfo, StatusResult};
 
@@ -193,6 +193,78 @@ pub fn commit(repo: &Repository, message: &str, author_name: &str, author_email:
     let oid = repo.odb.write(ObjectKind::Commit, &serialize_commit(&commit))?;
 
     // Move the ref HEAD points at; a detached HEAD updates HEAD itself.
+    let target =
+        grit_lib::refs::read_head(&repo.git_dir)?.unwrap_or_else(|| "HEAD".to_string());
+    grit_lib::refs::write_ref(&repo.git_dir, &target, &oid)?;
+    append_reflog(repo, &target, &oid);
+    Ok(oid.to_string())
+}
+
+/// Commit only `paths`, the way `git commit -- <paths>` does.
+///
+/// Everything else the user had staged stays staged. The commit's tree is
+/// therefore HEAD with just those paths overwritten, not the index filtered --
+/// a staged deletion the user did not name has to stay deleted, and a staged
+/// edit they did not name has to stay out.
+pub fn commit_only(
+    repo: &Repository,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+    paths: &[String],
+) -> Result<String> {
+    let index = repo.load_index()?;
+    let wanted: std::collections::HashSet<Vec<u8>> =
+        paths.iter().map(|p| p.as_bytes().to_vec()).collect();
+
+    // An unborn HEAD commits against the empty tree, so there is nothing to
+    // carry forward and the result is just the selected paths.
+    let head = head_sha(repo);
+    let base_tree_oid = match &head {
+        Some(sha) => commit_tree(repo, sha)?,
+        None => repo.odb.write(ObjectKind::Tree, &[])?,
+    };
+
+    // "Staged" has to mean the index entry differs from HEAD, not merely that the
+    // path is in the index. Otherwise committing a path the user edited but
+    // never staged would quietly create an empty commit.
+    let head_tree: BTreeMap<String, ObjectId> = match &head {
+        Some(sha) => tree_map(repo, sha)?,
+        None => BTreeMap::new(),
+    };
+    let staged_any = index.entries.iter().any(|e| {
+        wanted.contains(&e.path)
+            && e.stage() == 0
+            && head_tree
+            .get(String::from_utf8_lossy(&e.path).as_ref())
+            .copied()
+            != Some(e.oid)
+    });
+    if !staged_any {
+        bail!("none of the selected paths are staged");
+    }
+
+    let tree = write_tree_partial_from_index(&repo.odb, &index, &base_tree_oid, &wanted)?;
+
+    let mut parents: Vec<ObjectId> = Vec::new();
+    if let Some(sha) = &head {
+        parents.push(sha.parse().context("parse HEAD sha")?);
+    }
+
+    let ident = format_ident(author_name, author_email);
+    let commit = CommitData {
+        tree,
+        parents,
+        author: ident.clone(),
+        committer: ident,
+        author_raw: Vec::new(),
+        committer_raw: Vec::new(),
+        encoding: None,
+        message: format!("{}\n", message.trim_end()),
+        raw_message: None,
+    };
+    let oid = repo.odb.write(ObjectKind::Commit, &serialize_commit(&commit))?;
+
     let target =
         grit_lib::refs::read_head(&repo.git_dir)?.unwrap_or_else(|| "HEAD".to_string());
     grit_lib::refs::write_ref(&repo.git_dir, &target, &oid)?;

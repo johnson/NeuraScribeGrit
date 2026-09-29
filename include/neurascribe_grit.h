@@ -40,9 +40,23 @@ typedef GritHttpResponse (*GritHttpPostFn)(const char *url, const char *auth, co
                                           const char *git_protocol);
 typedef void (*GritHttpReleaseFn)(GritHttpResponse *response);
 
-/* Install the HTTP bridge. Pass NULL to clear it, which makes the next
- * network call fail loudly instead of looking like a clean fetch. */
-void grit_http_set_handlers(GritHttpGetFn get, GritHttpPostFn post, GritHttpReleaseFn release);
+/* The three verbs, handed to each network call as one struct.
+ *
+ * These used to be installed process-globally. grit takes its HttpClient as a
+ * parameter to http_fetch/push_http, so the global was never needed, and it
+ * raced: two overlapping operations could clear the handlers while one of them
+ * was mid-request, and three separate atomics could even be observed
+ * half-updated. Passing one struct per call makes the set move atomically and
+ * removes the install/uninstall pairing callers had to get right.
+ *
+ * `release` is mandatory whenever `get` or `post` is set — it is what frees the
+ * buffers Swift handed over. A NULL struct is allowed and makes the call fail
+ * with a clear message rather than transfer nothing. */
+typedef struct GritHttpCallbacks {
+    GritHttpGetFn get;
+    GritHttpPostFn post;
+    GritHttpReleaseFn release;
+} GritHttpCallbacks;
 
 /* Last error recorded on the calling thread. Never NULL; empty when there is
  * none. Release with grit_string_free. */
@@ -60,6 +74,7 @@ char *grit_repo_head_sha(GritRepoHandle *repo);
 /* 0 on success, -1 on failure (message in grit_last_error). */
 int32_t grit_repo_stage_all(GritRepoHandle *repo);
 char *grit_repo_commit(GritRepoHandle *repo, const char *message, const char *author_name, const char *author_email);
+char *grit_repo_commit_only(GritRepoHandle *repo, const char *message, const char *author_name, const char *author_email, const char *paths_json);
 char *grit_repo_diff_file(GritRepoHandle *repo, const char *path);
 char *grit_repo_diff_commit_json(GritRepoHandle *repo, const char *sha);
 /* Commits reachable from HEAD, newest first, by AUTHOR date (git
@@ -96,10 +111,11 @@ char *grit_repo_merge_base(GritRepoHandle *repo, const char *a, const char *b);
 char *grit_repo_blob_text(GritRepoHandle *repo, const char *sha, const char *path);
 char *grit_repo_work_tree(GritRepoHandle *repo);
 
-/* Network. `credential` is optional JSON: {"username":"…","password":"…"}. */
-char *grit_clone(const char *url, const char *dest, const char *branch, const char *credential);
-char *grit_repo_fetch_json(GritRepoHandle *repo, const char *url, const char *refspecs_json, const char *credential);
-char *grit_repo_push_json(GritRepoHandle *repo, const char *url, const char *branch, int32_t force, const char *credential);
+/* Network. `credential` is optional JSON: {"username":"…","password":"…"}.
+ * `http` carries the URLSession bridge for this call; see GritHttpCallbacks. */
+char *grit_clone(const char *url, const char *dest, const char *branch, const char *credential, const GritHttpCallbacks *http);
+char *grit_repo_fetch_json(GritRepoHandle *repo, const char *url, const char *refspecs_json, const char *credential, const GritHttpCallbacks *http);
+char *grit_repo_push_json(GritRepoHandle *repo, const char *url, const char *branch, int32_t force, const char *credential, const GritHttpCallbacks *http);
 
 /* Submodules. `grit_repo_submodules_json` returns an array of
    {name, path, url, indexed_sha, head_sha, initialized}; the two shas are null

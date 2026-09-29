@@ -19,35 +19,64 @@ import neurascribe_gritFFI
 
 /// Supplies HTTP for the grit backend.
 ///
-/// Call `install()` once during app start-up, before the first network
-/// operation. Operations that only touch the working tree do not need it.
-public enum GritHttpBridge {
+/// The verbs are handed to each network call as one `GritHttpCallbacks` value
+/// instead of being installed process-globally at start-up. grit takes its
+/// `HttpClient` as a parameter to `http_fetch`/`push_http`, so a global was
+/// never required — and it raced: two overlapping operations could have one of
+/// them clear the handlers while the other was mid-request, which invoked a
+/// release callback on freed closure state. As a struct there is nothing to
+/// install, uninstall, or keep in sync, and nothing to get wrong at a call
+/// site.
+///
+/// `GritNetwork.clone`/`fetch`/`push` take one of these and pass it down.
+public struct GritHttpBridge {
     /// How long a single request may take before we give up.
     ///
     /// Git over a large repository can legitimately take minutes on a bad
     /// connection, so this is generous on purpose: the alternative is a push
     /// that dies halfway through and leaves the remote in a state the user
     /// has to reason about.
-    public static var timeout: TimeInterval = 600
+    ///
+    /// Global rather than per-instance because the handlers are `@convention(c)`
+    /// function pointers, which cannot capture context.
+    public nonisolated(unsafe) static var timeout: TimeInterval = 600
 
     /// Responses larger than this are refused rather than buffered.
     ///
     /// A packfile for a large repository runs to hundreds of megabytes. The
     /// body reaches grit as one contiguous buffer because that is all the
     /// `HttpClient` trait takes, so there is no streaming path to fall back on.
-    public static var maximumResponseBytes = 512 * 1024 * 1024
+    public nonisolated(unsafe) static var maximumResponseBytes = 512 * 1024 * 1024
 
-    /// Whether the bridge is currently installed.
-    public private(set) static var isInstalled = false
+    public init() {}
+
+    /// The C struct for this call. Plain function pointers, so the struct
+    /// carries no lifetime obligation — the buffers it points at are owned by
+    /// the `Response` boxes that `handBack` keeps alive.
+    public var callbacks: GritHttpCallbacks {
+        withUnsafePointer(to: Self.getHandler) { get in
+            withUnsafePointer(to: Self.postHandler) { post in
+                withUnsafePointer(to: Self.releaseHandler) { release in
+                    GritHttpCallbacks(
+                        get: UnsafeMutableRawPointer(mutating: get)
+                            .assumingMemoryBound(to: GritHttpGetFn.self).pointee,
+                        post: UnsafeMutableRawPointer(mutating: post)
+                            .assumingMemoryBound(to: GritHttpPostFn.self).pointee,
+                        release: UnsafeMutableRawPointer(mutating: release)
+                            .assumingMemoryBound(to: GritHttpReleaseFn.self).pointee
+                    )
+                }
+            }
+        }
+    }
 
     // MARK: - Ownership
 
     /// The response a handler produced, kept alive until grit calls `release`.
     ///
     /// The C struct handed to Rust holds raw pointers into `body`, `finalURL`
-    /// and `error`, so this object must outlive the call. It is kept alive by an
-    /// unretained `Unmanaged` pointer travelling in the struct's `context`
-    /// field, which `release` converts back.
+    /// and `error`, so this object must outlive the call. A +1 reference
+    /// travels in the struct's `context` field and `release` consumes it.
     private final class Response {
         let body: [UInt8]
         /// NUL-terminated, so the pointer we hand out is a valid C string.
@@ -70,25 +99,11 @@ public enum GritHttpBridge {
         }
     }
 
-    // MARK: - Lifecycle
-
-    /// Install the bridge. Safe to call more than once; the first call wins.
-    public static func install() {
-        guard !isInstalled else { return }
-        isInstalled = true
-        grit_http_set_handlers(getHandler, postHandler, releaseHandler)
-    }
-
-    /// Remove the bridge so the next network call fails with a clear message
-    /// instead of appearing to hang.
-    public static func uninstall() {
-        guard isInstalled else { return }
-        isInstalled = false
-        grit_http_set_handlers(nil, nil, nil)
-    }
-
     // MARK: - C callbacks
 
+    // `static let` rather than instance methods: a `@convention(c)` function
+    // pointer cannot capture context, so the handlers must be non-capturing and
+    // reach their configuration through these statics.
     private static let getHandler: GritHttpGetFn = { url, auth, gitProtocol in
         guard let url, let parsed = URL(string: String(cString: url)) else {
             return failure("the URL is not parseable")
@@ -120,9 +135,9 @@ public enum GritHttpBridge {
         guard let response else { return }
         let context = response.pointee.context
         guard let context else { return }
-        // Balances the `passUnretained` in `handBack`. If this ever runs twice
-        // for one response it would over-release, so the contract is exactly
-        // one release per response, which is what the Rust side guarantees.
+        // Balances the `passRetained` in `handBack`. If this ever ran twice for
+        // one response it would over-release, so the contract is exactly one
+        // release per response, which is what the Rust side guarantees.
         Unmanaged<Response>.fromOpaque(context).release()
     }
 
@@ -158,7 +173,7 @@ public enum GritHttpBridge {
         gitProtocol: UnsafePointer<CChar>?
     ) -> GritHttpResponse {
         var request = request
-        request.timeoutInterval = timeout
+        request.timeoutInterval = Self.timeout
         if let auth {
             request.setValue(String(cString: auth), forHTTPHeaderField: "Authorization")
         }
@@ -189,18 +204,23 @@ public enum GritHttpBridge {
         }
         if let message { return failure(message) }
         guard let data else { return failure(GritBridgeError.noResponse.localizedDescription) }
-        guard data.count <= maximumResponseBytes else {
-            return failure("the server sent \(data.count) bytes, over the \(maximumResponseBytes)-byte limit")
+        guard data.count <= Self.maximumResponseBytes else {
+            return failure("the server sent \(data.count) bytes, over the \(Self.maximumResponseBytes)-byte limit")
         }
         return handBack(body: [UInt8](data), finalURL: url, error: nil, status: status)
     }
 
     // MARK: - Handoff
 
-    /// Package a response and hand Rust an unretained pointer to its box.
+    /// Package a response and hand Rust a +1 pointer to its box.
+    ///
+    /// `passRetained`, not `passUnretained`. The local `response` below dies
+    /// when this function returns, and grit calls `release` much later, so an
+    /// unretained pointer would be a use-after-free on every single request.
+    /// The +1 is balanced by the `release` handler.
     private static func handBack(body: [UInt8], finalURL: String?, error: String?, status: Int32) -> GritHttpResponse {
         let response = Response(body: body, finalURL: finalURL, error: error)
-        let context = Unmanaged.passUnretained(response).toOpaque()
+        let context = Unmanaged.passRetained(response).toOpaque()
         return response.body.withUnsafeBytes { bodyBuffer in
             response.finalURLBytes.withUnsafeBufferPointer { finalURLBuffer in
                 response.errorBytes.withUnsafeBufferPointer { errorBuffer in

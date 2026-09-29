@@ -194,6 +194,44 @@ pub extern "C" fn grit_repo_commit(
     guard_string(|| ops::commit(repo, &message, &name, &email))
 }
 
+/// Commit only the named paths, the way `git commit -- <paths>` does.
+///
+/// `paths` is a JSON array of repository-relative paths. Anything else the user
+/// had staged stays staged. Returns the new sha or NULL.
+#[no_mangle]
+pub extern "C" fn grit_repo_commit_only(
+    repo: *mut Repository,
+    message: *const c_char,
+    author_name: *const c_char,
+    author_email: *const c_char,
+    paths_json: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(message) = (unsafe { take_str(message) }) else {
+        set_error("null commit message");
+        return std::ptr::null_mut();
+    };
+    let name = unsafe { take_str(author_name) }.unwrap_or_else(|| "NeuraScribe".to_string());
+    let email =
+        unsafe { take_str(author_email) }.unwrap_or_else(|| "app@neurascribe.local".to_string());
+    let Some(raw) = (unsafe { take_str(paths_json) }) else {
+        set_error("null paths");
+        return std::ptr::null_mut();
+    };
+    let paths: Vec<String> = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(&format!("paths is not a JSON array of strings: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    guard_string(|| ops::commit_only(repo, &message, &name, &email, &paths))
+}
+
 /// Unified diff of one path, HEAD vs work tree.
 #[no_mangle]
 pub extern "C" fn grit_repo_diff_file(repo: *mut Repository, path: *const c_char) -> *mut c_char {
@@ -505,6 +543,19 @@ unsafe fn take_credential(json: *const c_char) -> Option<types::Credential> {
     serde_json::from_str(&raw).ok()
 }
 
+
+/// Read the per-call HTTP callbacks the embedder passed in.
+///
+/// A NULL pointer means the embedder has no HTTP bridge, which the client turns
+/// into a clear error rather than a silent no-op.
+unsafe fn take_callbacks(p: *const crate::http::HttpCallbacks) -> crate::http::HttpCallbacks {
+    if p.is_null() {
+        crate::http::HttpCallbacks::none()
+    } else {
+        *p
+    }
+}
+
 /// Clone `url` into a new repository at `dest`. Returns the checked-out commit
 /// sha, or NULL on failure.
 #[no_mangle]
@@ -513,6 +564,7 @@ pub extern "C" fn grit_clone(
     dest: *const c_char,
     branch: *const c_char,
     credential: *const c_char,
+    http: *const crate::http::HttpCallbacks,
 ) -> *mut c_char {
     let (url, dest) = match (unsafe { take_str(url) }, unsafe { take_str(dest) }) {
         (Some(u), Some(d)) => (u, d),
@@ -524,7 +576,13 @@ pub extern "C" fn grit_clone(
     let branch = unsafe { take_str(branch) };
     let credential = unsafe { take_credential(credential) };
     guard_string(|| {
-        net::clone(&url, Path::new(&dest), branch.as_deref(), credential.as_ref())
+        net::clone(
+            &url,
+            Path::new(&dest),
+            branch.as_deref(),
+            credential.as_ref(),
+            unsafe { take_callbacks(http) },
+        )
     })
 }
 
@@ -535,6 +593,7 @@ pub extern "C" fn grit_repo_fetch_json(
     url: *const c_char,
     refspecs_json: *const c_char,
     credential: *const c_char,
+    http: *const crate::http::HttpCallbacks,
 ) -> *mut c_char {
     if repo.is_null() {
         set_error("null repo");
@@ -551,7 +610,13 @@ pub extern "C" fn grit_repo_fetch_json(
 
     let credential = unsafe { take_credential(credential) };
     guard_json(move || {
-        let result = net::fetch(&repo.git_dir, &url, &refspecs, credential.as_ref())?;
+        let result = net::fetch(
+            &repo.git_dir,
+            &url,
+            &refspecs,
+            credential.as_ref(),
+            unsafe { take_callbacks(http) },
+        )?;
         serde_json::to_value(result).map_err(anyhow::Error::from)
     })
 }
@@ -564,6 +629,7 @@ pub extern "C" fn grit_repo_push_json(
     branch: *const c_char,
     force: i32,
     credential: *const c_char,
+    http: *const crate::http::HttpCallbacks,
 ) -> *mut c_char {
     if repo.is_null() {
         set_error("null repo");
@@ -580,7 +646,14 @@ pub extern "C" fn grit_repo_push_json(
     let credential = unsafe { take_credential(credential) };
     let force = force != 0;
     guard_json(move || {
-        let result = net::push(&repo.git_dir, &url, &branch, force, credential.as_ref())?;
+        let result = net::push(
+            &repo.git_dir,
+            &url,
+            &branch,
+            force,
+            credential.as_ref(),
+            unsafe { take_callbacks(http) },
+        )?;
         serde_json::to_value(result).map_err(anyhow::Error::from)
     })
 }
