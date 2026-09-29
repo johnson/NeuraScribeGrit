@@ -101,8 +101,27 @@ char *grit_clone(const char *url, const char *dest, const char *branch, const ch
 char *grit_repo_fetch_json(GritRepoHandle *repo, const char *url, const char *refspecs_json, const char *credential);
 char *grit_repo_push_json(GritRepoHandle *repo, const char *url, const char *branch, int32_t force, const char *credential);
 
+/* Submodules. `grit_repo_submodules_json` returns an array of
+   {name, path, url, indexed_sha, head_sha, initialized}; the two shas are null
+   and `initialized` is false when the submodule is not checked out. */
+char *grit_repo_submodules_json(GritRepoHandle *repo);
+/* 0 on success, -1 on failure. The clone must already exist. */
+int32_t grit_repo_record_submodule(GritRepoHandle *repo, const char *name, const char *path, const char *url, const char *sha);
+/* Drops the registration, the gitlink, the work tree and .git/modules/<name>. */
+int32_t grit_repo_remove_submodule(GritRepoHandle *repo, const char *path);
+/* Checks the submodule's work tree out at the superproject's recorded commit. */
+char *grit_repo_checkout_submodule_to(GritRepoHandle *repo, const char *path, const char *sha);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* NEURASCRIBE_GRIT_H */
+
+/// Paths the index tracks below a directory, as a JSON array of strings.
+/// Returns NULL on failure; free with grit_string_free.
+char *grit_repo_indexed_paths_under_json(GritRepoHandle *repo, const char *directory);
+
+/// Stop tracking everything under a directory, leaving the files on disk
+/// (git rm -r --cached). Returns entries removed, or -1 on failure.
+int32_t grit_repo_untrack_directory(GritRepoHandle *repo, const char *directory);

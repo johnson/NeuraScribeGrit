@@ -9,8 +9,10 @@
 //!   the Swift side decodes into its own Codable types.
 
 pub mod http;
+pub mod index_ops;
 pub mod net;
 pub mod ops;
+pub mod submodules;
 pub mod types;
 
 use std::cell::RefCell;
@@ -583,3 +585,133 @@ pub extern "C" fn grit_repo_push_json(
     })
 }
 
+// ---- submodules -----------------------------------------------------------
+
+/// Every `submodule.<name>` section in `.gitmodules`, as JSON.
+#[no_mangle]
+pub unsafe extern "C" fn grit_repo_submodules_json(
+    repo: *mut Repository,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_json(move || {
+        let list = submodules::submodules(&repo)?;
+        serde_json::to_value(list).map_err(anyhow::Error::from)
+    })
+}
+
+/// Record a submodule: write its `.gitmodules` section and stage its gitlink.
+///
+/// The clone must already exist; this only records it.
+#[no_mangle]
+pub unsafe extern "C" fn grit_repo_record_submodule(
+    repo: *mut Repository,
+    name: *const c_char,
+    path: *const c_char,
+    url: *const c_char,
+    sha: *const c_char,
+) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let (Some(name), Some(path), Some(url), Some(sha)) = (
+        unsafe { take_str(name) },
+        unsafe { take_str(path) },
+        unsafe { take_str(url) },
+        unsafe { take_str(sha) },
+    ) else {
+        set_error("null name, path, url or sha");
+        return -1;
+    };
+    guard_unit(move || submodules::record_submodule(&repo, &name, &path, &url, &sha))
+}
+
+/// Drop a submodule's registration, gitlink, work tree and own repository.
+#[no_mangle]
+pub unsafe extern "C" fn grit_repo_remove_submodule(
+    repo: *mut Repository,
+    path: *const c_char,
+) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(path) = (unsafe { take_str(path) }) else {
+        set_error("null path");
+        return -1;
+    };
+    guard_unit(move || submodules::remove_submodule(&repo, &path))
+}
+
+/// Check the submodule out at the commit the superproject records.
+#[no_mangle]
+pub unsafe extern "C" fn grit_repo_checkout_submodule_to(
+    repo: *mut Repository,
+    path: *const c_char,
+    sha: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let (Some(path), Some(sha)) = (unsafe { take_str(path) }, unsafe { take_str(sha) }) else {
+        set_error("null path or sha");
+        return std::ptr::null_mut();
+    };
+    guard_string(move || submodules::checkout_submodule_to(&repo, &path, &sha))
+}
+
+/// Paths the index tracks below a directory, as a JSON array of strings.
+///
+/// Answers "is anything under this directory still tracked" without a
+/// directory listing, so files present on disk but never added do not count.
+#[no_mangle]
+pub unsafe extern "C" fn grit_repo_indexed_paths_under_json(
+    repo: *mut Repository,
+    directory: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(directory) = (unsafe { take_str(directory) }) else {
+        set_error("null directory");
+        return std::ptr::null_mut();
+    };
+    guard_json(move || Ok(serde_json::to_value(index_ops::indexed_paths_under(&repo, &directory)?)?))
+}
+
+/// Stop tracking everything under a directory, leaving the files on disk.
+///
+/// This is `git rm -r --cached`. Returns the number of index entries
+/// removed, or -1 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn grit_repo_untrack_directory(
+    repo: *mut Repository,
+    directory: *const c_char,
+) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(directory) = (unsafe { take_str(directory) }) else {
+        set_error("null directory");
+        return -1;
+    };
+    match index_ops::untrack_directory(&repo, &directory) {
+        Ok(n) => n as i32,
+        Err(e) => {
+            set_error(&e.to_string());
+            -1
+        }
+    }
+}

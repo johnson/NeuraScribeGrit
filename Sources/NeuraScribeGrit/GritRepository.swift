@@ -252,6 +252,87 @@ public final class GritRepository {
         }
     }
 
+    // MARK: - Submodules
+
+    /// Every submodule registered in `.gitmodules`, sorted by work-tree path.
+    ///
+    /// grit has no `submodule` porcelain, so this is assembled from the index
+    /// gitlink plus `.gitmodules`. `indexedSha` is the commit the superproject
+    /// records; `headSha` is where the work tree actually is — the two
+    /// differing is what makes a submodule show up as modified.
+    public func submodules() throws -> [GritSubmoduleInfo] {
+        try decode([GritSubmoduleInfo].self) {
+            grit_repo_submodules_json(handle)
+        }
+    }
+
+    /// Register a submodule and stage its gitlink.
+    ///
+    /// The work tree must already be a clone of `url`; this writes the
+    /// `.gitmodules` section and the gitlink at `sha`, and stages
+    /// `.gitmodules` alongside it so one commit captures the whole thing.
+    public func recordSubmodule(name: String, path: String, url: String, sha: String) throws {
+        let ok = name.withCString { namePointer in
+            path.withCString { pathPointer in
+                url.withCString { urlPointer in
+                    sha.withCString { shaPointer in
+                        grit_repo_record_submodule(handle, namePointer, pathPointer, urlPointer, shaPointer)
+                    }
+                }
+            }
+        }
+        guard ok == 0 else { throw GritError.lastFailed }
+    }
+
+    /// Remove a submodule: registration, gitlink, work tree and the
+    /// submodule's own repository under `.git/modules`.
+    public func removeSubmodule(path: String) throws {
+        let ok = path.withCString { grit_repo_remove_submodule(handle, $0) }
+        guard ok == 0 else { throw GritError.lastFailed }
+    }
+
+    /// Check a submodule out at the commit the superproject records.
+    ///
+    /// - Returns: the commit the submodule is now on.
+    @discardableResult
+    public func checkoutSubmodule(path: String, to sha: String) throws -> String {
+        try decode(String.self) {
+            path.withCString { pathPointer in
+                sha.withCString { shaPointer in
+                    grit_repo_checkout_submodule_to(handle, pathPointer, shaPointer)
+                }
+            }
+        }
+    }
+    // MARK: - Index
+
+    /// Paths git currently tracks below `directory`.
+    ///
+    /// - Not a directory listing: files present on disk that were never added
+    ///   do not appear, which is what makes this a meaningful "is it still
+    ///   tracked" check.
+    public func indexedPaths(under directory: String) throws -> [String] {
+        try decode([String].self) {
+            directory.withCString {
+                grit_repo_indexed_paths_under_json(handle, $0)
+            }
+        }
+    }
+
+    /// Stop tracking everything below `directory`, leaving the files on disk.
+    ///
+    /// This is `git rm -r --cached`.
+    ///
+    /// - Returns: how many index entries were removed; 0 when nothing there
+    ///   was tracked.
+    @discardableResult
+    public func untrackDirectory(_ directory: String) throws -> Int {
+        let ok = directory.withCString {
+            grit_repo_untrack_directory(handle, $0)
+        }
+        guard ok >= 0 else { throw GritError.lastFailed }
+        return Int(ok)
+    }
     // MARK: - C plumbing
 
     /// The raw handle, for the network entry points in `GritNetwork`.

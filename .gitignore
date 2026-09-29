@@ -7,3 +7,6 @@
 # ExFAT (this repo lives on Store2T) mangles modes and litters AppleDouble files.
 ._*
 .DS_Store
+
+# Xcode/SwiftPM local state
+.swiftpm/

@@ -130,3 +130,26 @@ extension GritCommit: Decodable {
         body = try container.decode(String.self, forKey: .message)
     }
 }
+
+/// One submodule registration, with the state the app's UI shows.
+public struct GritSubmoduleInfo: Codable, Hashable, Sendable {
+    /// The `submodule.<name>` section name in `.gitmodules`.
+    public let name: String
+    /// Work-tree path relative to the repository root.
+    public let path: String
+    /// Clone URL exactly as written in `.gitmodules`.
+    public let url: String
+    /// The commit the superproject's index records; nil when there is no
+    /// gitlink, which means the registration exists but was never staged.
+    public let indexedSha: String?
+    /// The commit the submodule's work tree is on; nil when not checked out.
+    public let headSha: String?
+    /// Whether the work tree exists with a usable git dir.
+    public let initialized: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case name, path, url, initialized
+        case indexedSha = "indexed_sha"
+        case headSha = "head_sha"
+    }
+}
