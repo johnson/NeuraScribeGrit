@@ -19,7 +19,8 @@ let package = Package(
             targets: ["NeuraScribeGrit"]
         ),
         // Throwaway diagnostic harness; not shipped, not depended on.
-        .executable(name: "gritDiag", targets: ["gritDiag"])
+        .executable(name: "gritDiag", targets: ["gritDiag"]),
+        .executable(name: "gritBench", targets: ["gritBench"])
     ],
     targets: [
         // Static library built from the Rust shim in this same package.
@@ -47,6 +48,11 @@ let package = Package(
             name: "gritDiag",
             dependencies: ["NeuraScribeGrit"],
             path: "Sources/gritDiag"
+        ),
+        .executableTarget(
+            name: "gritBench",
+            dependencies: ["NeuraScribeGrit"],
+            path: "Sources/gritBench"
         ),
         .testTarget(
             name: "NeuraScribeGritTests",
