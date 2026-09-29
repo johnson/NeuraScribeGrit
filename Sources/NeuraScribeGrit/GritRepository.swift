@@ -210,6 +210,20 @@ public final class GritRepository {
         try takeString { sha.withCString { grit_repo_reset_hard_to(handle, $0) } }
     }
 
+    /// Whether this repository can still read the object named by the SHA.
+    ///
+    /// The app's history lists are built from commit hashes and can outlive the
+    /// objects behind them: a commit can be pruned, or made on another device
+    /// and never fetched here. Every action on such a row then fails deep
+    /// inside the object store with a bare hash, so callers check this first
+    /// and can say something the user can act on.
+    ///
+    /// Absence is an ordinary answer, not an error, so a repository that does
+    /// not have the object returns false without touching the last-error slot.
+    public func hasObject(_ sha: String) -> Bool {
+        sha.withCString { grit_repo_has_object(handle, $0) } == 1
+    }
+
     /// Re-checkout the current branch, discarding working-tree changes.
     @discardableResult
     public func forceCheckoutHEAD() throws -> String {

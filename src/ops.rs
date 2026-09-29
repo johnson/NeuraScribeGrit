@@ -183,7 +183,7 @@ pub fn commit(repo: &Repository, message: &str, author_name: &str, author_email:
         tree,
         parents,
         author: ident.clone(),
-        committer: ident,
+        committer: ident.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
@@ -195,8 +195,9 @@ pub fn commit(repo: &Repository, message: &str, author_name: &str, author_email:
     // Move the ref HEAD points at; a detached HEAD updates HEAD itself.
     let target =
         grit_lib::refs::read_head(&repo.git_dir)?.unwrap_or_else(|| "HEAD".to_string());
+    let previous = ref_value(repo, &target);
     grit_lib::refs::write_ref(&repo.git_dir, &target, &oid)?;
-    append_reflog(repo, &target, &oid);
+    append_reflog(repo, &target, &previous, &oid, &ident, &commit_reflog_message(message));
     Ok(oid.to_string())
 }
 
@@ -256,7 +257,7 @@ pub fn commit_only(
         tree,
         parents,
         author: ident.clone(),
-        committer: ident,
+        committer: ident.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
@@ -267,8 +268,9 @@ pub fn commit_only(
 
     let target =
         grit_lib::refs::read_head(&repo.git_dir)?.unwrap_or_else(|| "HEAD".to_string());
+    let previous = ref_value(repo, &target);
     grit_lib::refs::write_ref(&repo.git_dir, &target, &oid)?;
-    append_reflog(repo, &target, &oid);
+    append_reflog(repo, &target, &previous, &oid, &ident, &commit_reflog_message(message));
     Ok(oid.to_string())
 }
 
@@ -348,6 +350,16 @@ pub fn reset_file_to_head(repo: &Repository, path: &str) -> Result<()> {
 /// Hard reset to `sha`: rewrite the work tree, the index and the ref.
 pub fn reset_hard_to(repo: &Repository, sha: &str) -> Result<String> {
     let oid: ObjectId = sha.parse().with_context(|| format!("bad commit {sha}"))?;
+    // Checked before anything is touched, so a commit that is not here fails
+    // while the work tree and HEAD are still untouched. Left to fail deeper in
+    // the odb, the user gets a bare "object not found" naming a hash they have
+    // no way to act on, with no hint that the commit itself is the problem.
+    if !repo.odb.exists(&oid) {
+        bail!(
+            "commit {sha} is not in this repository; it was pruned, or it was made \
+             on another device that has not been fetched here"
+        );
+    }
     let tree = commit_tree(repo, sha)?;
     let work_tree = repo.work_tree.as_deref().context("bare repository has no work tree")?;
 
@@ -383,7 +395,19 @@ pub fn reset_hard_to(repo: &Repository, sha: &str) -> Result<String> {
     write_index_clean(repo, &mut index)?;
     let target =
         grit_lib::refs::read_head(&repo.git_dir)?.unwrap_or_else(|| "HEAD".to_string());
+    let previous = ref_value(repo, &target);
     grit_lib::refs::write_ref(&repo.git_dir, &target, &oid)?;
+    // The work tree is already rewritten at this point, so the reflog has to be
+    // written here or not at all: a failure after this point would leave HEAD
+    // moved with no record of where it came from.
+    append_reflog(
+        repo,
+        &target,
+        &previous,
+        &oid,
+        APP_REFLOG_IDENTITY,
+        &format!("reset: moving to {sha}"),
+    );
     Ok(oid.to_string())
 }
 
@@ -862,16 +886,63 @@ fn format_ident(name: &str, email: &str) -> String {
     format!("{name} <{email}> {secs} +0000")
 }
 
-/// Reflogs are advisory; a failure here must not fail the commit.
-fn append_reflog(repo: &Repository, refname: &str, oid: &ObjectId) {
-    let path = repo.git_dir.join("logs").join(refname);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+/// Reflog message for a commit, matching what git records: the command, then
+/// the subject line only. A multi-line body would have to be escaped to stay on
+/// one reflog line, and no one reads a reflog for the body.
+fn commit_reflog_message(message: &str) -> String {
+    let subject = message.trim().lines().next().unwrap_or("").trim();
+    if subject.is_empty() {
+        "commit".to_string()
+    } else {
+        format!("commit: {subject}")
     }
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        let _ = writeln!(f, "{} {} NeuraScribe <app@neurascribe.local> 0 +0000", zero_oid(), oid);
+}
+
+/// Identity recorded for ref moves the app makes outside a commit, where
+/// the caller supplies no author.
+const APP_REFLOG_IDENTITY: &str = "NeuraScribe <app@neurascribe.local>";
+
+/// Append a reflog entry to the ref that moved *and* to HEAD's log, the way
+/// git does: moving a branch that HEAD points at is recorded twice, once
+/// under the branch and once under HEAD, so "git reflog" (which reads HEAD by
+/// default) and "git reflog show main" agree. Writing only the branch log
+/// leaves HEAD's trail frozen, which is exactly how a reset can go unrecorded.
+///
+/// Advisory, like git's own: a reflog that cannot be written must not fail the
+/// commit that already succeeded.
+fn append_reflog(
+    repo: &Repository,
+    refname: &str,
+    old_oid: &ObjectId,
+    new_oid: &ObjectId,
+    identity: &str,
+    message: &str,
+) {
+    let write = |name: &str| {
+        let _ = grit_lib::refs::append_reflog(
+            &repo.git_dir,
+            name,
+            old_oid,
+            new_oid,
+            identity,
+            message,
+            true,
+        );
+    };
+    write(refname);
+    // Detached HEAD: the moved ref *is* HEAD, already written above.
+    if refname != "HEAD"
+        && grit_lib::refs::read_head(&repo.git_dir).ok().flatten().as_deref() == Some(refname)
+    {
+        write("HEAD");
     }
+}
+
+/// Current value of a ref, or the zero oid when it does not exist yet.
+///
+/// Read *before* the ref is written; afterwards the old value is gone.
+fn ref_value(repo: &Repository, refname: &str) -> ObjectId {
+    grit_lib::refs::resolve_ref(&repo.git_dir, refname).unwrap_or_else(|_| ObjectId::zero())
 }
 
 /// Path -> oid map for a commit, used by tests and diagnostics.

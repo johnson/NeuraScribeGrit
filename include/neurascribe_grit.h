@@ -1,6 +1,6 @@
 /* NeuraScribeGrit — C ABI for the grit-backed Git backend.
  *
- * Hand-written rather than generated: the shim exports 26 functions, and
+ * Hand-written rather than generated: the shim exports 38 functions, and
  * cbindgen would add a build step (and a version pin) to save 60 lines.
  * Keep this in step with `src/lib.rs` in ../ (the Rust crate).
  */
@@ -125,6 +125,11 @@ GritRepoHandle *grit_repo_open(const char *path);
 void grit_repo_free(GritRepoHandle *repo);
 /* 1 when path is a repository, 0 otherwise (never an error). */
 int32_t grit_repo_exists(const char *path);
+
+/* Whether the repository can still read the object named by sha.
+ * 1 present, 0 absent, -1 on a bad argument (message in grit_last_error).
+ * Absence is an ordinary answer, not an error, so it records nothing there. */
+int32_t grit_repo_has_object(GritRepoHandle *repo, const char *sha);
 
 char *grit_repo_status_json(GritRepoHandle *repo);
 char *grit_repo_current_branch(GritRepoHandle *repo);

@@ -330,6 +330,119 @@ fn hard_reset_removes_untracked_file_added_later() {
     );
 }
 
+/// The reflog has to answer "which commit was HEAD before this, who moved
+/// it, when, and why" — that is the only trail left when a commit later turns
+/// out to be unreadable. The old writer emitted the all-zero previous value,
+/// a fabricated identity, a zero timestamp and no message, which is the exact
+/// line git writes when a ref is *created*: every app commit looked like a
+/// branch creation and the question was unanswerable.
+#[test]
+fn reflog_records_real_previous_value_identity_and_message() {
+    let dir = fixture();
+    let root = dir.path();
+    let before = git(root, &["rev-parse", "HEAD"]).trim().to_string();
+
+    fs::write(root.join("notes/one.md"), "line one\nline two\nline three\n").unwrap();
+    let repo = ops::open(root).unwrap();
+    ops::stage_all(&repo).unwrap();
+    let sha = ops::commit(&repo, "sync: wip (1 files)", "NeuraScribe", "committer@neurascribe.com")
+        .unwrap();
+
+    let raw = fs::read_to_string(root.join(".git/logs/refs/heads/main")).unwrap();
+    let last = raw.lines().last().expect("reflog has no entries");
+    let fields: Vec<&str> = last.split_whitespace().collect();
+
+    assert_eq!(fields[0], before, "reflog did not record the previous HEAD");
+    assert_ne!(fields[0], "0".repeat(40), "previous value is the null oid, so this reads as a ref creation");
+    assert_eq!(fields[1], sha, "reflog did not record the new commit");
+    assert_eq!(
+        fields[2..4],
+        ["NeuraScribe", "<committer@neurascribe.com>"],
+        "reflog did not record the real committer"
+    );
+    let stamp: i64 = fields[4].parse().expect("timestamp is not a number");
+    assert!(stamp > 1_700_000_000, "reflog timestamp was not written: {stamp}");
+    assert!(
+        last.ends_with("\tcommit: sync: wip (1 files)"),
+        "expected git's tab-separated message, got {last:?}"
+    );
+}
+
+/// A reset moves the ref too, and it is the move most likely to strand a user
+/// ("which commit was I on before?"). It must be on the record as well.
+#[test]
+fn hard_reset_is_recorded_in_the_reflog() {
+    let dir = fixture();
+    let root = dir.path();
+    let first = git(root, &["rev-list", "--max-parents=0", "HEAD"]).trim().to_string();
+    let second = git(root, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let repo = ops::open(root).unwrap();
+    ops::reset_hard_to(&repo, &first).unwrap();
+
+    let raw = fs::read_to_string(root.join(".git/logs/refs/heads/main")).unwrap();
+    let last = raw.lines().last().expect("reflog has no entries");
+    let fields: Vec<&str> = last.split_whitespace().collect();
+    assert_eq!(fields[0], second, "reset did not record the commit it left");
+    assert_eq!(fields[1], first, "reset did not record where it moved to");
+    assert!(last.contains("reset: moving to"), "reset message missing: {last:?}");
+}
+
+/// git can read back what we wrote, and it agrees the chain is continuous.
+/// Without the old value the chain is broken exactly where it matters.
+#[test]
+fn git_reflog_agrees_with_ours() {
+    let dir = fixture();
+    let root = dir.path();
+    let before = git(root, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // A real content change: committing an unchanged tree with the same parent
+    // and the same timestamp reproduces the existing commit object byte for
+    // byte, so the ref would not move and there would be nothing to read back.
+    fs::write(root.join("notes/one.md"), "line one\nline two\nplus a line\n").unwrap();
+    let repo = ops::open(root).unwrap();
+    ops::stage_all(&repo).unwrap();
+    ops::commit(&repo, "from grit", "NeuraScribe", "committer@neurascribe.com").unwrap();
+
+    let out = git(root, &["reflog", "show", "--pretty=%H %gs"]);
+    assert!(
+        out.contains("commit: from grit"),
+        "git cannot read our reflog message: {out}"
+    );
+    // "git reflog" reads HEAD's log, not the branch's, so writing only the
+    // branch log would leave this empty.
+    let on_branch = git(root, &["reflog", "show", "main", "--pretty=%gs"]);
+    assert!(
+        on_branch.contains("commit: from grit"),
+        "the branch log and HEAD's log disagree: {on_branch}"
+    );
+    let first = out.lines().next().expect("reflog is empty").split_whitespace().next().unwrap();
+    let parent = git(root, &["rev-parse", "HEAD^"]).trim().to_string();
+    assert_eq!(first, git(root, &["rev-parse", "HEAD"]).trim());
+    assert_eq!(parent, before, "the commit chain does not reach the previous HEAD");
+}
+
+/// A commit the repository does not have must be named as such, before the
+/// work tree or HEAD is touched — the user needs to know the *commit* is the
+/// problem, and that nothing was changed.
+#[test]
+fn reset_to_a_missing_commit_explains_itself_and_changes_nothing() {
+    let dir = fixture();
+    let root = dir.path();
+    let head_before = git(root, &["rev-parse", "HEAD"]).trim().to_string();
+    let tree_before = fs::read_to_string(root.join("notes/one.md")).unwrap();
+
+    let absent = "0".repeat(39) + "1";
+    let repo = ops::open(root).unwrap();
+    let err = ops::reset_hard_to(&repo, &absent).unwrap_err().to_string();
+
+    assert!(err.contains("not in this repository"), "error does not say what is wrong: {err}");
+    assert!(err.contains(&absent), "error does not name the commit: {err}");
+    assert!(err.contains("fetched"), "error does not suggest a way out: {err}");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), head_before, "HEAD moved on a failed reset");
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), tree_before, "work tree changed on a failed reset");
+}
+
 #[test]
 fn executable_bit_survives_status_and_commit() {
     let dir = fixture();

@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
 
+use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 
 thread_local! {
@@ -106,6 +107,35 @@ fn guard_unit<F: FnOnce() -> anyhow::Result<()>>(f: F) -> i32 {
             -1
         }
     }
+}
+
+/// Whether the repository can still read the object named by `sha`.
+///
+/// Returns 1 for present, 0 for absent, -1 when the argument is not a SHA.
+/// Absence is an ordinary answer, not an error, so nothing is recorded in the
+/// last-error slot: a caller asking "is this commit still here?" should not
+/// have to distinguish "no" from "I could not tell".
+///
+/// The app needs this because its history list can outlive the objects behind
+/// it. A row is rendered from a commit hash captured earlier; if that commit is
+/// pruned, or was made on another device and never fetched here, every action
+/// on the row fails deep inside the odb with a bare hash and no explanation.
+#[no_mangle]
+pub extern "C" fn grit_repo_has_object(repo: *mut Repository, sha: *const c_char) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(sha) = (unsafe { take_str(sha) }) else {
+        set_error("null sha");
+        return -1;
+    };
+    let Ok(oid) = sha.parse::<ObjectId>() else {
+        set_error("not a SHA");
+        return -1;
+    };
+    i32::from(repo.odb.exists(&oid))
 }
 
 /// Open a repository. Returns NULL when `path` is not inside a work tree.
