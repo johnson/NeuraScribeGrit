@@ -8,12 +8,14 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use grit_lib::transfer::{FetchOptions, FetchOutcome, PushOptions, PushRefSpec, TagMode};
 
 use crate::http;
 use crate::ops;
+use crate::progress::{ByteCounters, ProgressBridge, ProgressCallbacks, ProgressReporter};
 use crate::types::Credential;
 
 /// A finished fetch, in the shape the Swift side already decodes.
@@ -136,6 +138,30 @@ fn local_remote_path(url: &str) -> Option<std::path::PathBuf> {
     }
     Some(std::path::PathBuf::from(trimmed))
 }
+/// Announce the refs a fetch moved, then the byte total.
+///
+/// `RefUpdate` carries the source ref, the local ref it was written to, and both
+/// OIDs, so this is the `update_tips` hook with real values rather than a
+/// reconstruction. `received_bytes` is measured at the HTTP boundary and is 0
+/// for a local remote, which has no such boundary.
+fn report_fetch(reporter: &ProgressReporter, outcome: &FetchOutcome, received_bytes: u64) {
+    let mut moved = 0u32;
+    for update in &outcome.updates {
+        let Some(new_oid) = &update.new_oid else { continue };
+        let refname = update.local_ref.as_ref().unwrap_or(&update.remote_ref);
+        // Both OIDs have to live past the call, so bind them first; each
+        // `to_hex` is a fresh String that would drop at the end of the
+        // argument list.
+        let old_hex = update.old_oid.map(|o| o.to_hex());
+        let new_hex = new_oid.to_hex();
+        reporter.update_tip(refname, old_hex.as_deref(), Some(&new_hex));
+        moved += 1;
+    }
+    if moved > 0 || received_bytes > 0 {
+        reporter.transfer(moved, received_bytes);
+    }
+}
+
 /// Fetch from `url` into the repository whose git dir is `git_dir`.
 pub fn fetch(
     git_dir: &Path,
@@ -143,11 +169,14 @@ pub fn fetch(
     refspecs: &[String],
     cred: Option<&Credential>,
     callbacks: http::HttpCallbacks,
+    progress: ProgressCallbacks,
 ) -> Result<FetchResult> {
     // A local remote must not go through the HTTP bridge. URLSession has no
     // file:// transport, so the request fails before it starts; and even if
     // it did, it would be the wrong path -- git serves a local remote straight
     // from the object database. grit already has that transport, so use it.
+    let reporter = ProgressReporter::new(progress);
+
     if let Some(remote_git_dir) = local_remote_path(url) {
         let outcome = grit_lib::transfer::fetch_local(
             git_dir,
@@ -155,20 +184,26 @@ pub fn fetch(
             &fetch_options(refspecs.to_vec()),
         )
         .with_context(|| format!("fetch from {} failed", remote_git_dir.display()))?;
+        // No HTTP boundary, so no byte total to report; the ref updates
+        // below are still real.
+        report_fetch(&reporter, &outcome, 0);
         return Ok(FetchResult::from_outcome(&outcome));
     }
 
-    let client = http::client_for(cred, callbacks)?;
+    let counters = Arc::new(ByteCounters::default());
+    let client = http::client_for(cred, callbacks, counters.clone())?;
     let base = http_base_url(url);
+    let mut bridge = ProgressBridge::new(progress);
     let outcome = grit_lib::transport::http::http_fetch(
         client.as_ref(),
         git_dir,
         &base,
         &fetch_options(refspecs.to_vec()),
-        &mut grit_lib::fetch::NoProgress,
+        &mut bridge,
     )
     .with_context(|| format!("fetch from {base} failed"))?;
 
+    report_fetch(&reporter, &outcome, counters.received());
     Ok(FetchResult::from_outcome(&outcome))
 }
 
@@ -180,6 +215,7 @@ pub fn clone(
     branch: Option<&str>,
     cred: Option<&Credential>,
     callbacks: http::HttpCallbacks,
+    progress: ProgressCallbacks,
 ) -> Result<String> {
     if dest.exists() {
         bail!("clone target already exists: {}", dest.display());
@@ -192,7 +228,11 @@ pub fn clone(
     let base = http_base_url(url);
     write_remote(&repo.git_dir, "origin", &base)?;
 
-    let client = http::client_for(cred, callbacks)?;
+    let reporter = ProgressReporter::new(progress);
+    let counters = Arc::new(ByteCounters::default());
+    let client = http::client_for(cred, callbacks, counters.clone())?;
+    let mut bridge = ProgressBridge::new(progress);
+
     // grit's fetch has no "fetch everything" mode -- an empty refspec list
     // writes nothing -- so the remote-tracking namespace is populated first
     // and the branch is created from it afterwards. `git clone` orders it
@@ -202,9 +242,10 @@ pub fn clone(
         &repo.git_dir,
         &base,
         &fetch_options(vec![format!("+refs/heads/*:{TRACKING_PREFIX}*")]),
-        &mut grit_lib::fetch::NoProgress,
+        &mut bridge,
     )
     .with_context(|| format!("clone from {base} failed"))?;
+    report_fetch(&reporter, &outcome, counters.received());
 
     let name = match branch {
         Some(name) => name.to_string(),
@@ -229,6 +270,7 @@ pub fn push(
     force: bool,
     cred: Option<&Credential>,
     callbacks: http::HttpCallbacks,
+    progress: ProgressCallbacks,
 ) -> Result<PushResult> {
     let local_ref = format!("refs/heads/{branch}");
     let src: grit_lib::objects::ObjectId = grit_lib::refs::resolve_ref(git_dir, &local_ref)
@@ -248,7 +290,17 @@ pub fn push(
         push_options: Vec::new(),
     };
 
-    let client = http::client_for(cred, callbacks)?;
+    let reporter = ProgressReporter::new(progress);
+    // The one update about to be sent. The old value is whatever the server
+    // holds and is not known until the advertisement comes back, so it is
+    // omitted rather than guessed.
+    reporter.push_negotiation(&local_ref, &src.to_hex());
+    reporter.pack(0);
+
+    let counters = Arc::new(ByteCounters::default());
+    let client = http::client_for(cred, callbacks, counters.clone())?;
+    let mut bridge = ProgressBridge::new(progress);
+
     let base = http_base_url(url);
     let outcome = grit_lib::push::push_http(
         client.as_ref(),
@@ -256,9 +308,11 @@ pub fn push(
         &base,
         &refs,
         &opts,
-        &mut grit_lib::fetch::NoProgress,
+        &mut bridge,
     )
     .with_context(|| format!("push to {base} failed"))?;
+    reporter.pack(1);
+    reporter.push_transfer(counters.sent());
 
     let mut pushed = Vec::new();
     for result in &outcome.results {
@@ -267,6 +321,10 @@ pub fn push(
             grit_lib::push_report::PushRefStatus::UpToDate => ("up_to_date", None),
             other => ("rejected", result.message.clone().or_else(|| Some(format!("{other:?}")))),
         };
+        // The verdict the server gave, announced as it is decided rather than
+        // replayed at the end, so a slow push can show which ref is still
+        // outstanding.
+        reporter.push_update_ref(&result.remote_ref, reason.as_deref());
         pushed.push(PushedRef {
             name: result.remote_ref.clone(),
             status: status.to_string(),

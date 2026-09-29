@@ -3,11 +3,9 @@
 //  Replaces the MiniGit/libgit2 path. The protocol is grit-lib's own smart-HTTP
 //  transport, which speaks v0/v1; GritHttpBridge supplies URLSession underneath.
 //
-//  Not covered, and deliberately so: the push progress callbacks. grit's
-//  `Progress` trait has a single `message(&[u8])` method, so per-ref updates, pack
-//  progress and negotiation hooks have nowhere to land. The caller finds out
-//  once, at the end. That is a UI regression rather than a correctness one —
-//  noted here so nobody re-derives it.
+//  Progress: GritProgressBridge carries the seven hooks. They are not equally well
+//  informed, and GritProgressEvent says which numbers are real and which are
+//  absent (nil, not 0) — so a caller must not assume every hook fires.
 
 import Foundation
 
@@ -58,14 +56,22 @@ public enum GritNetwork {
         to destination: String,
         branch: String? = nil,
         credential: GritCredential? = nil,
-        http: GritHttpBridge = GritHttpBridge()
+        http: GritHttpBridge = GritHttpBridge(),
+        progress: GritProgressBridge = .silent
     ) throws -> String {
-        let raw = url.withCString { urlPointer in
-            destination.withCString { destPointer in
-                let branchPointer = branch?.withCString { UnsafePointer($0) }
-                let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                return withUnsafePointer(to: http.callbacks) { callbacks in
-                    grit_clone(urlPointer, destPointer, branchPointer, credentialPointer, callbacks)
+        let raw = GritProgressBridge.withRegistration(progress) { progressCallbacks in
+            withUnsafePointer(to: progressCallbacks) { progress in
+                url.withCString { urlPointer in
+                    destination.withCString { destPointer in
+                        let branchPointer = branch?.withCString { UnsafePointer($0) }
+                        let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
+                        return withUnsafePointer(to: http.callbacks) { callbacks in
+                            grit_clone(
+                                urlPointer, destPointer, branchPointer, credentialPointer,
+                                callbacks, progress
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -82,16 +88,22 @@ public enum GritNetwork {
         url: String,
         refspecs: [String],
         credential: GritCredential? = nil,
-        http: GritHttpBridge = GritHttpBridge()
+        http: GritHttpBridge = GritHttpBridge(),
+        progress: GritProgressBridge = .silent
     ) throws -> GritFetchResult {
         let encoded = (try? String(decoding: JSONEncoder().encode(refspecs), as: UTF8.self)) ?? "[]"
-        let raw = url.withCString { urlPointer in
-            encoded.withCString { refspecPointer in
-                let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                return withUnsafePointer(to: http.callbacks) { callbacks in
-                    grit_repo_fetch_json(
-                        repository.rawHandle, urlPointer, refspecPointer, credentialPointer, callbacks
-                    )
+        let raw = GritProgressBridge.withRegistration(progress) { progressCallbacks in
+            withUnsafePointer(to: progressCallbacks) { progress in
+                url.withCString { urlPointer in
+                    encoded.withCString { refspecPointer in
+                        let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
+                        return withUnsafePointer(to: http.callbacks) { callbacks in
+                            grit_repo_fetch_json(
+                                repository.rawHandle, urlPointer, refspecPointer,
+                                credentialPointer, callbacks, progress
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -105,20 +117,26 @@ public enum GritNetwork {
         branch: String,
         force: Bool = false,
         credential: GritCredential? = nil,
-        http: GritHttpBridge = GritHttpBridge()
+        http: GritHttpBridge = GritHttpBridge(),
+        progress: GritProgressBridge = .silent
     ) throws -> [GritPushResult] {
-        let raw = url.withCString { urlPointer in
-            branch.withCString { branchPointer in
-                let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
-                return withUnsafePointer(to: http.callbacks) { callbacks in
-                    grit_repo_push_json(
-                        repository.rawHandle,
-                        urlPointer,
-                        branchPointer,
-                        force ? 1 : 0,
-                        credentialPointer,
-                        callbacks
-                    )
+        let raw = GritProgressBridge.withRegistration(progress) { progressCallbacks in
+            withUnsafePointer(to: progressCallbacks) { progress in
+                url.withCString { urlPointer in
+                    branch.withCString { branchPointer in
+                        let credentialPointer = credential?.shimJSON?.withCString { UnsafePointer($0) }
+                        return withUnsafePointer(to: http.callbacks) { callbacks in
+                            grit_repo_push_json(
+                                repository.rawHandle,
+                                urlPointer,
+                                branchPointer,
+                                force ? 1 : 0,
+                                credentialPointer,
+                                callbacks,
+                                progress
+                            )
+                        }
+                    }
                 }
             }
         }

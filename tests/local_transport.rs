@@ -8,7 +8,19 @@
 use std::path::Path;
 use std::process::Command;
 
-use neurascribe_grit_ffi::{net, ops};
+use neurascribe_grit_ffi::{http::HttpCallbacks, net, ops, progress::ProgressCallbacks};
+
+/// The host build uses grit's own ureq client, so the embedder hands over no
+/// Swift callbacks. Kept as a helper so each call site stays readable.
+fn no_progress() -> ProgressCallbacks {
+    ProgressCallbacks::none()
+}
+
+/// A local remote never reaches the HTTP bridge, so this is what the call
+/// site passes to prove it.
+fn no_http() -> HttpCallbacks {
+    HttpCallbacks::none()
+}
 
 const REFS: &str = "refs/heads/*:refs/remotes/origin/*";
 
@@ -59,7 +71,8 @@ fn plain_path_remote_fetches_without_the_http_bridge() {
         remote.to_str().expect("utf8"),
         &[REFS.to_string()],
         None,
-        neurascribe_grit_ffi::http::HttpCallbacks::none(),
+        no_http(),
+        no_progress(),
     )
     .expect("a local remote must not need the HTTP bridge");
 
@@ -78,7 +91,7 @@ fn file_url_remote_fetches_too() {
     let local = empty_local(dir.path());
 
     let url = format!("file://{}", remote.display());
-    let result = net::fetch(local.as_path(), &url, &[REFS.to_string()], None, neurascribe_grit_ffi::http::HttpCallbacks::none())
+    let result = net::fetch(local.as_path(), &url, &[REFS.to_string()], None, no_http(), no_progress())
         .expect("a file:// remote is local");
     assert!(result.updated_refs.contains_key("refs/remotes/origin/main"));
 }
@@ -96,7 +109,8 @@ fn an_https_remote_is_not_treated_as_local() {
         "https://example.invalid/repo.git",
         &[REFS.to_string()],
         None,
-        neurascribe_grit_ffi::http::HttpCallbacks::none(),
+        no_http(),
+        no_progress(),
     )
     .expect_err("no bridge is installed, so this cannot succeed");
     let message = format!("{err:#}");

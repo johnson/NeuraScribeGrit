@@ -12,6 +12,7 @@ pub mod http;
 pub mod index_ops;
 pub mod net;
 pub mod ops;
+pub mod progress;
 pub mod submodules;
 pub mod types;
 
@@ -546,6 +547,18 @@ unsafe fn take_credential(json: *const c_char) -> Option<types::Credential> {
 
 /// Read the per-call HTTP callbacks the embedder passed in.
 ///
+/// A NULL pointer means the embedder wants no progress, which is not an error:
+/// progress is a nicety, and an operation that reports none still succeeds.
+unsafe fn take_progress(
+    p: *const crate::progress::ProgressCallbacks,
+) -> crate::progress::ProgressCallbacks {
+    if p.is_null() {
+        crate::progress::ProgressCallbacks::none()
+    } else {
+        *p
+    }
+}
+
 /// A NULL pointer means the embedder has no HTTP bridge, which the client turns
 /// into a clear error rather than a silent no-op.
 unsafe fn take_callbacks(p: *const crate::http::HttpCallbacks) -> crate::http::HttpCallbacks {
@@ -565,6 +578,7 @@ pub extern "C" fn grit_clone(
     branch: *const c_char,
     credential: *const c_char,
     http: *const crate::http::HttpCallbacks,
+    progress: *const crate::progress::ProgressCallbacks,
 ) -> *mut c_char {
     let (url, dest) = match (unsafe { take_str(url) }, unsafe { take_str(dest) }) {
         (Some(u), Some(d)) => (u, d),
@@ -582,6 +596,7 @@ pub extern "C" fn grit_clone(
             branch.as_deref(),
             credential.as_ref(),
             unsafe { take_callbacks(http) },
+            unsafe { take_progress(progress) },
         )
     })
 }
@@ -594,6 +609,7 @@ pub extern "C" fn grit_repo_fetch_json(
     refspecs_json: *const c_char,
     credential: *const c_char,
     http: *const crate::http::HttpCallbacks,
+    progress: *const crate::progress::ProgressCallbacks,
 ) -> *mut c_char {
     if repo.is_null() {
         set_error("null repo");
@@ -616,6 +632,7 @@ pub extern "C" fn grit_repo_fetch_json(
             &refspecs,
             credential.as_ref(),
             unsafe { take_callbacks(http) },
+            unsafe { take_progress(progress) },
         )?;
         serde_json::to_value(result).map_err(anyhow::Error::from)
     })
@@ -630,6 +647,7 @@ pub extern "C" fn grit_repo_push_json(
     force: i32,
     credential: *const c_char,
     http: *const crate::http::HttpCallbacks,
+    progress: *const crate::progress::ProgressCallbacks,
 ) -> *mut c_char {
     if repo.is_null() {
         set_error("null repo");
@@ -653,6 +671,7 @@ pub extern "C" fn grit_repo_push_json(
             force,
             credential.as_ref(),
             unsafe { take_callbacks(http) },
+            unsafe { take_progress(progress) },
         )?;
         serde_json::to_value(result).map_err(anyhow::Error::from)
     })

@@ -58,6 +58,64 @@ typedef struct GritHttpCallbacks {
     GritHttpReleaseFn release;
 } GritHttpCallbacks;
 
+/* Progress. Every hook is optional; a NULL member simply never fires, and a
+ * NULL struct is fine -- progress is a nicety, and an operation that reports
+ * none still succeeds.
+ *
+ * These are the seven hooks the old libgit2-backed shim exposed, and each one
+ * says what it can and cannot know. The rule throughout: a number that is not
+ * measured is 0, never a guess. A progress bar showing an invented percentage
+ * is worse than no bar.
+ *
+ *   sideband        Live, during the transfer. This is grit's own channel 2 --
+ *                   the same text git prints as "remote: Counting objects".
+ *                   Real.
+ *   update_tip      One ref that moved, with both OIDs (NULL when the ref was
+ *                   created or deleted). Real, from grit's RefUpdate.
+ *   push_update_ref One ref's verdict, as the server gives it. "status" is NULL
+ *                   when accepted. Real, from grit's PushRefResult.
+ *   push_negotiation
+ *                   The update about to be sent, with its local tip. The old oid
+ *                   is absent by design: the server's value is not known until
+ *                   the advertisement comes back. Real as far as it goes.
+ *   transfer        "received_bytes" is measured at the HTTP boundary; the
+ *                   object and delta counts are 0, because grit does not
+ *                   report them. For a local remote even the byte count is 0 --
+ *                   there is no boundary to measure.
+ *   pack            A phase marker only: "stage" 0 is building, 1 is uploading.
+ *                   grit builds the pack inside push_http and exposes no object
+ *                   counts while it does, so current and total are 0.
+ *   push_transfer   The request-body bytes actually sent. current and total are
+ *                   0 for the same reason as pack.
+ *
+ * Passed per call for the same reason the HTTP ones are: a set of globals can
+ * be observed half-updated. */
+typedef void (*GritProgressSidebandFn)(void *context, const char *text);
+typedef void (*GritProgressTransferFn)(void *context, uint32_t total_objects, uint32_t indexed_objects,
+                                      uint32_t received_objects, uint32_t local_objects,
+                                      uint32_t total_deltas, uint32_t indexed_deltas,
+                                      uint64_t received_bytes);
+typedef void (*GritProgressUpdateTipFn)(void *context, const char *refname, const char *old_oid, const char *new_oid);
+typedef void (*GritProgressPackFn)(void *context, int32_t stage, uint32_t current, uint32_t total);
+typedef void (*GritProgressPushTransferFn)(void *context, uint32_t current, uint32_t total, uint64_t bytes);
+typedef void (*GritProgressPushUpdateRefFn)(void *context, const char *refname, const char *status);
+typedef void (*GritProgressPushNegotiationFn)(void *context, const char *refname, const char *new_oid);
+
+typedef struct GritProgressCallbacks {
+    GritProgressSidebandFn sideband;
+    GritProgressTransferFn transfer;
+    GritProgressUpdateTipFn update_tip;
+    GritProgressPackFn pack;
+    GritProgressPushTransferFn push_transfer;
+    GritProgressPushUpdateRefFn push_update_ref;
+    GritProgressPushNegotiationFn push_negotiation;
+    /* Opaque embedder state, handed back as the first argument of every hook.
+     * A C function pointer cannot capture, so this is the only way a Swift sink
+     * is reachable at all. It is never interpreted or freed here, and it travels
+     * by value with the struct, so it cannot outlive the call it was given to. */
+    void *context;
+} GritProgressCallbacks;
+
 /* Last error recorded on the calling thread. Never NULL; empty when there is
  * none. Release with grit_string_free. */
 char *grit_last_error(void);
@@ -113,9 +171,12 @@ char *grit_repo_work_tree(GritRepoHandle *repo);
 
 /* Network. `credential` is optional JSON: {"username":"…","password":"…"}.
  * `http` carries the URLSession bridge for this call; see GritHttpCallbacks. */
-char *grit_clone(const char *url, const char *dest, const char *branch, const char *credential, const GritHttpCallbacks *http);
-char *grit_repo_fetch_json(GritRepoHandle *repo, const char *url, const char *refspecs_json, const char *credential, const GritHttpCallbacks *http);
-char *grit_repo_push_json(GritRepoHandle *repo, const char *url, const char *branch, int32_t force, const char *credential, const GritHttpCallbacks *http);
+char *grit_clone(const char *url, const char *dest, const char *branch, const char *credential, const GritHttpCallbacks *http,
+                            const GritProgressCallbacks *progress);
+char *grit_repo_fetch_json(GritRepoHandle *repo, const char *url, const char *refspecs_json, const char *credential, const GritHttpCallbacks *http,
+                            const GritProgressCallbacks *progress);
+char *grit_repo_push_json(GritRepoHandle *repo, const char *url, const char *branch, int32_t force, const char *credential, const GritHttpCallbacks *http,
+                            const GritProgressCallbacks *progress);
 
 /* Submodules. `grit_repo_submodules_json` returns an array of
    {name, path, url, indexed_sha, head_sha, initialized}; the two shas are null

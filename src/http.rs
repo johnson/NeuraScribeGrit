@@ -207,6 +207,9 @@ pub struct CallbackHttpClient {
     /// `Authorization` header cached from the last successful exchange, so the
     /// common case is one round trip rather than two.
     auth_header: Mutex<Option<String>>,
+    /// Bytes that crossed the boundary, for the progress reporter. The
+    /// trait methods take `&self`, so this cannot be a plain integer.
+    counters: Arc<crate::progress::ByteCounters>,
 }
 
 impl CallbackHttpClient {
@@ -214,8 +217,9 @@ impl CallbackHttpClient {
     pub fn new(
         callbacks: HttpCallbacks,
         credentials: Arc<dyn CredentialProvider + Send + Sync>,
+        counters: Arc<crate::progress::ByteCounters>,
     ) -> Self {
-        Self { callbacks, credentials, auth_header: Mutex::new(None) }
+        Self { callbacks, credentials, auth_header: Mutex::new(None), counters }
     }
 
     /// Do one request, retrying exactly once after a 401, the way git does.
@@ -328,6 +332,7 @@ impl HttpClient for CallbackHttpClient {
             let copied = copy_out(response, self.callbacks.release)?;
             let final_url = copied.final_url.clone();
             let body = copied.body.clone();
+            self.counters.add_received(body.len());
             Ok((copied, (body, final_url)))
         })
     }
@@ -363,8 +368,10 @@ impl HttpClient for CallbackHttpClient {
                 body.len(),
                 protocol_ptr,
             );
+            self.counters.add_sent(body.len());
             let copied = copy_out(response, self.callbacks.release)?;
             let bytes = copied.body.clone();
+            self.counters.add_received(bytes.len());
             Ok((copied, bytes))
         })
     }
@@ -383,8 +390,18 @@ pub fn provider_for(cred: Option<&CredentialSpec>) -> Arc<dyn CredentialProvider
 }
 
 /// The client the network operations run against, via grit's ureq backend.
+///
+/// The callbacks and the counters are accepted and ignored here. Under this
+/// feature grit owns the whole transport, so there is no seam to count bytes at
+/// and no Swift side to call back into -- which is why the counters stay at 0
+/// and the progress UI shows a phase without a byte total. That is the honest
+/// result for this build, not a silent no-op.
 #[cfg(feature = "http-ureq")]
-pub fn client_for(cred: Option<&CredentialSpec>) -> Result<Arc<dyn HttpClient>> {
+pub fn client_for(
+    cred: Option<&CredentialSpec>,
+    _callbacks: HttpCallbacks,
+    _counters: Arc<crate::progress::ByteCounters>,
+) -> Result<Arc<dyn HttpClient>> {
     use grit_lib::transport::http::ureq_client::UreqHttpClient;
 
     let client = match cred {
@@ -404,6 +421,7 @@ pub fn client_for(cred: Option<&CredentialSpec>) -> Result<Arc<dyn HttpClient>> 
 pub fn client_for(
     cred: Option<&CredentialSpec>,
     callbacks: HttpCallbacks,
+    counters: Arc<crate::progress::ByteCounters>,
 ) -> Result<Arc<dyn HttpClient>> {
-    Ok(Arc::new(CallbackHttpClient::new(callbacks, provider_for(cred))))
+    Ok(Arc::new(CallbackHttpClient::new(callbacks, provider_for(cred), counters)))
 }

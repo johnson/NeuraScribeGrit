@@ -9,12 +9,19 @@
 use std::path::Path;
 use std::process::Command;
 
-use neurascribe_grit_ffi::{http::HttpCallbacks, net, ops, types::Credential};
+use neurascribe_grit_ffi::{http::HttpCallbacks, net, ops, progress::ProgressCallbacks, types::Credential};
 
 /// The host build uses grit's own ureq client, so the embedder hands over
 /// no Swift callbacks. Kept as a helper so each call site stays readable.
 fn no_http() -> HttpCallbacks {
     HttpCallbacks::none()
+}
+
+/// The host build runs without a Swift bridge and nobody is watching, so
+/// progress is the empty set. Kept as a helper so each call site stays
+/// readable.
+fn no_progress() -> ProgressCallbacks {
+    ProgressCallbacks::none()
 }
 
 const USER: &str = "tester";
@@ -44,9 +51,17 @@ fn base64(input: &str) -> String {
     out
 }
 
-/// True when the test server is reachable, so the suite stays runnable
-/// without it instead of failing for an unrelated reason.
+/// True when these tests can run at all, so the suite stays runnable without
+/// the server instead of failing for an unrelated reason.
+///
+/// Two things have to hold. The `http-ureq` feature is what gives the host build
+/// a real HTTP client -- without it the only transport is the Swift bridge, and
+/// there is no Swift side here to supply one. And the server has to be up.
+/// Checking only the second is how these tests used to pass without running:
+/// the server was simply never up.
 fn server_up() -> bool {
+    #[cfg(not(feature = "http-ureq"))]
+    return false;
     let spec = format!("{}/info/refs?service=git-upload-pack", net::http_base_url(&url()));
     let auth = base64(&format!("{USER}:{PASS}"));
     Command::new("curl")
@@ -121,7 +136,7 @@ fn clone_produces_the_same_tree_as_git() {
     let ours = dir.path().join("grit");
     let theirs = dir.path().join("git");
 
-    let head = net::clone(&url(), &ours, None, Some(&credential()), no_http()).expect("grit clone");
+    let head = net::clone(&url(), &ours, None, Some(&credential()), no_http(), no_progress()).expect("grit clone");
     clone_with_git(&theirs);
 
     assert_eq!(
@@ -153,7 +168,7 @@ fn fetch_reports_the_same_refs_git_does() {
     let ours = dir.path().join("grit");
     let theirs = dir.path().join("git");
 
-    net::clone(&url(), &ours, None, Some(&credential()), no_http()).expect("grit clone");
+    net::clone(&url(), &ours, None, Some(&credential()), no_http(), no_progress()).expect("grit clone");
     clone_with_git(&theirs);
 
     let result = net::fetch(
@@ -162,6 +177,7 @@ fn fetch_reports_the_same_refs_git_does() {
         &["refs/heads/*:refs/remotes/origin/*".to_string()],
         Some(&credential()),
         no_http(),
+        no_progress(),
     )
     .expect("grit fetch");
     let ours_tip = git(&ours, &["rev-parse", "HEAD"]);
@@ -194,7 +210,7 @@ fn push_lands_the_commit_git_would_land() {
     let theirs = dir.path().join("git");
 
     // Two independent clones, so the push below is a real ref update.
-    net::clone(&url(), &ours, None, Some(&credential()), no_http()).expect("grit clone");
+    net::clone(&url(), &ours, None, Some(&credential()), no_http(), no_progress()).expect("grit clone");
     clone_with_git(&theirs);
 
     std::fs::write(ours.join("pushed.md"), "hello from grit").expect("write file");
@@ -203,7 +219,7 @@ fn push_lands_the_commit_git_would_land() {
     let sha = ops::commit(&repo, "pushed by the grit shim", "Test", "test@example.com")
         .expect("commit");
 
-    let result = net::push(&ours.join(".git"), &url(), "main", false, Some(&credential()), no_http())
+    let result = net::push(&ours.join(".git"), &url(), "main", false, Some(&credential()), no_http(), no_progress())
         .expect("grit push");
 
     assert_eq!(result.refs.len(), 1, "one ref was pushed");
@@ -232,9 +248,9 @@ fn push_reports_up_to_date_rather_than_failing() {
     }
     let dir = tempfile::tempdir().expect("temp dir");
     let ours = dir.path().join("grit");
-    net::clone(&url(), &ours, None, Some(&credential()), no_http()).expect("grit clone");
+    net::clone(&url(), &ours, None, Some(&credential()), no_http(), no_progress()).expect("grit clone");
 
-    let result = net::push(&ours.join(".git"), &url(), "main", false, Some(&credential()), no_http())
+    let result = net::push(&ours.join(".git"), &url(), "main", false, Some(&credential()), no_http(), no_progress())
         .expect("a no-op push should succeed");
     assert_eq!(
         result.refs[0].status, "up_to_date",
@@ -254,7 +270,7 @@ fn bad_credentials_fail_with_an_auth_error_not_a_hang() {
         username: USER.to_string(),
         password: "definitely-not-the-password".to_string(),
     };
-    let err = net::clone(&url(), &dir.path().join("nope"), None, Some(&bad), no_http())
+    let err = net::clone(&url(), &dir.path().join("nope"), None, Some(&bad), no_http(), no_progress())
         .expect_err("a wrong password must not succeed");
     let text = format!("{err:#}").to_lowercase();
     assert!(
