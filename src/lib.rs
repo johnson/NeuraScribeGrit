@@ -8,6 +8,8 @@
 //! * structured results are JSON, which keeps the ABI small and stable while
 //!   the Swift side decodes into its own Codable types.
 
+pub mod http;
+pub mod net;
 pub mod ops;
 pub mod types;
 
@@ -415,3 +417,93 @@ pub extern "C" fn grit_repo_work_tree(repo: *mut Repository) -> *mut c_char {
         None => std::ptr::null_mut(),
     }
 }
+
+// MARK: - network
+
+/// Optional credentials, as a JSON object `{"username":…,"password":…}`.
+/// A null pointer means "no credential".
+unsafe fn take_credential(json: *const c_char) -> Option<types::Credential> {
+    let raw = take_str(json)?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Clone `url` into a new repository at `dest`. Returns the checked-out commit
+/// sha, or NULL on failure.
+#[no_mangle]
+pub extern "C" fn grit_clone(
+    url: *const c_char,
+    dest: *const c_char,
+    branch: *const c_char,
+    credential: *const c_char,
+) -> *mut c_char {
+    let (url, dest) = match (unsafe { take_str(url) }, unsafe { take_str(dest) }) {
+        (Some(u), Some(d)) => (u, d),
+        _ => {
+            set_error("null url or dest");
+            return std::ptr::null_mut();
+        }
+    };
+    let branch = unsafe { take_str(branch) };
+    let credential = unsafe { take_credential(credential) };
+    guard_string(|| {
+        net::clone(&url, Path::new(&dest), branch.as_deref(), credential.as_ref())
+    })
+}
+
+/// Fetch into an already-open repository. Returns fetch JSON, or NULL.
+#[no_mangle]
+pub extern "C" fn grit_repo_fetch_json(
+    repo: *mut Repository,
+    url: *const c_char,
+    refspecs_json: *const c_char,
+    credential: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(url) = (unsafe { take_str(url) }) else {
+        set_error("null url");
+        return std::ptr::null_mut();
+    };
+    let refspecs: Vec<String> = unsafe { take_str(refspecs_json) }
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+
+    let credential = unsafe { take_credential(credential) };
+    guard_json(move || {
+        let result = net::fetch(&repo.git_dir, &url, &refspecs, credential.as_ref())?;
+        serde_json::to_value(result).map_err(anyhow::Error::from)
+    })
+}
+
+/// Push `branch` to the same-named branch on `url`. Returns push JSON, or NULL.
+#[no_mangle]
+pub extern "C" fn grit_repo_push_json(
+    repo: *mut Repository,
+    url: *const c_char,
+    branch: *const c_char,
+    force: i32,
+    credential: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let (url, branch) = match (unsafe { take_str(url) }, unsafe { take_str(branch) }) {
+        (Some(u), Some(b)) => (u, b),
+        _ => {
+            set_error("null url or branch");
+            return std::ptr::null_mut();
+        }
+    };
+    let credential = unsafe { take_credential(credential) };
+    let force = force != 0;
+    guard_json(move || {
+        let result = net::push(&repo.git_dir, &url, &branch, force, credential.as_ref())?;
+        serde_json::to_value(result).map_err(anyhow::Error::from)
+    })
+}
+

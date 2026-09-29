@@ -286,6 +286,17 @@ pub fn reset_hard_to(repo: &Repository, sha: &str) -> Result<String> {
     Ok(oid.to_string())
 }
 
+/// Put HEAD on `branch` pointing at `sha`, and materialise the work tree.
+///
+/// HEAD is written as a symbolic ref rather than left detached, because a
+/// clone that lands on a detached HEAD cannot commit or pull without the user
+/// first noticing.
+pub fn checkout_branch(repo: &Repository, branch: &str, sha: &str) -> Result<String> {
+    let refname = format!("refs/heads/{branch}");
+    grit_lib::refs::write_symbolic_ref(&repo.git_dir, "HEAD", &refname)?;
+    reset_hard_to(repo, sha)
+}
+
 /// Discard all work-tree changes and go back to HEAD.
 pub fn force_checkout_head(repo: &Repository) -> Result<String> {
     let sha = head_sha(repo).ok_or_else(|| anyhow!("HEAD does not point at a commit"))?;

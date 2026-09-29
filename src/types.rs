@@ -43,6 +43,24 @@ pub struct RemoteInfo {
     pub url: String,
 }
 
+/// Credentials the app already holds for a remote.
+///
+/// grit would normally consult a `credential.helper`, but that is a subprocess
+/// and unavailable on iOS, so the app hands the password over directly. Field
+/// names match `GixCredential` in `neurascribe_git_ffi.swift`.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct Credential {
+    pub username: String,
+    pub password: String,
+}
+
+impl Credential {
+    /// True when neither half carries anything worth sending.
+    pub fn is_empty(&self) -> bool {
+        self.username.is_empty() && self.password.is_empty()
+    }
+}
+
 /// How a merge finished.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind")]

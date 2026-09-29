@@ -12,6 +12,11 @@ name = "neurascribe_grit_ffi"
 # same code the Swift side calls.
 crate-type = ["staticlib", "rlib"]
 
+[features]
+# Host-only: lets the differential suite reach a real git server over HTTP.
+# Never enabled for the iOS build, which routes through Swift URLSession instead.
+http-ureq = ["grit-lib/http-ureq"]
+
 [dependencies]
 # grit-lib is MIT (verified in its Cargo.toml). Pinned to the commit this spike was
 # validated against; grit-git is GPL-2.0 and is deliberately NOT depended on.
