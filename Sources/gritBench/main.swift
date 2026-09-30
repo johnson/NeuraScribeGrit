@@ -17,6 +17,11 @@ struct GritBench {
             logMode(args)
             return
         }
+        if args.first == "diff" {
+            args.removeFirst()
+            diffMode(args)
+            return
+        }
         if args.first == "logsteps" {
             args.removeFirst()
             logSteps(args)
@@ -105,6 +110,43 @@ struct GritBench {
                      coldMs, warm.medianMs, warm.minMs, warm.maxMs))
         print(String(format: "  git  log -50    %8.1f ms (%d commits)", gitMs, gitOut))
         print("  grit returned \(cold?.count ?? -1) commit(s)")
+    }
+
+    /// What one whole-tree diff costs, which is what the daily review pays per
+    /// commit and the home-screen feed used to pay for five it never read.
+    static func diffMode(_ args: [String]) {
+        guard let path = args.first else {
+            print("usage: gritBench diff <repo> [commits]")
+            return
+        }
+        let count = args.count > 1 ? (Int(args[1]) ?? 5) : 5
+        guard let repo = try? GritRepository(path: path) else {
+            print("cannot open \(path)")
+            return
+        }
+        guard let commits = try? repo.log(limit: count) else {
+            print("cannot read the log")
+            return
+        }
+
+        var coldTotal = 0.0
+        var totalFiles = 0
+        for (index, commit) in commits.enumerated() {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let files = (try? repo.diff(commit: commit.hash).count) ?? 0
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            coldTotal += ms
+            totalFiles += files
+            print(String(format: "  diff #%d %@ %8.1f ms  %d file(s)", index, String(commit.hash.prefix(7)), ms, files))
+        }
+
+        let warm = measure(count) {
+            _ = try? repo.diff(commit: commits[0].hash)
+        }
+        print("")
+        print("repo: \(path)  commits=\(commits.count)  files changed across them=\(totalFiles)")
+        print(String(format: "  first pass  %8.1f ms total", coldTotal))
+        print(String(format: "  same diff   %8.1f ms warm median", warm.medianMs))
     }
 
     /// Where the first call's time goes, step by step, in one fresh process.
