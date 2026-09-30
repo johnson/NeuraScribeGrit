@@ -157,7 +157,14 @@ fn an_absent_object_reads_as_absent_and_records_no_error() {
     let malformed = c("not a sha");
     let answer = neurascribe_grit_ffi::grit_repo_has_object(repo, malformed.as_ptr());
     assert_eq!(answer, -1, "a malformed argument is an error");
-    assert!(last_error().contains("not a SHA"), "and it must say why");
+    // The message carries the string that was rejected. A caller staring at a
+    // bare "not an object id" cannot tell a truncated hash from a line of
+    // prose that was never a hash, and those need different fixes.
+    assert!(
+        last_error().contains("not an object id") && last_error().contains("not a sha"),
+        "and it must say what was rejected: {}",
+        last_error()
+    );
 
     unsafe { neurascribe_grit_ffi::grit_repo_free(repo) };
 }

@@ -220,8 +220,16 @@ public final class GritRepository {
     ///
     /// Absence is an ordinary answer, not an error, so a repository that does
     /// not have the object returns false without touching the last-error slot.
-    public func hasObject(_ sha: String) -> Bool {
-        sha.withCString { grit_repo_has_object(handle, $0) } == 1
+    ///
+    /// - Throws: when the check itself could not be made -- a null handle, or a
+    ///   string that is not an object id. Those used to be reported as `false`,
+    ///   which is a different claim: "this commit is gone" instead of "I could
+    ///   not find out". A caller acting on that difference either discards a
+    ///   perfectly good commit or explains the wrong thing to the user.
+    public func hasObject(_ sha: String) throws -> Bool {
+        let result = sha.withCString { grit_repo_has_object(handle, $0) }
+        if result < 0 { throw GritError.failure() }
+        return result == 1
     }
 
     /// Re-checkout the current branch, discarding working-tree changes.

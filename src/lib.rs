@@ -130,6 +130,7 @@ fn guard_unit<F: FnOnce() -> anyhow::Result<()>>(f: F) -> i32 {
 /// on the row fails deep inside the odb with a bare hash and no explanation.
 #[no_mangle]
 pub extern "C" fn grit_repo_has_object(repo: *mut Repository, sha: *const c_char) -> i32 {
+    clear_error();
     if repo.is_null() {
         set_error("null repo");
         return -1;
@@ -140,7 +141,7 @@ pub extern "C" fn grit_repo_has_object(repo: *mut Repository, sha: *const c_char
         return -1;
     };
     let Ok(oid) = sha.parse::<ObjectId>() else {
-        set_error("not a SHA");
+        set_error(&format!("not an object id: {sha:?}"));
         return -1;
     };
     i32::from(repo.odb.exists(&oid))

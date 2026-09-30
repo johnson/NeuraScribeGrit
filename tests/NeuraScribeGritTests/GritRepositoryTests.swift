@@ -100,20 +100,26 @@ struct GritRepositoryTests {
         #expect(try !repo.status().hasChanges)
     }
 
-    @Test("a commit the repository cannot read is reported as absent, not as an error")
+    @Test("a commit the repository cannot read is absent, and a bad argument is an error")
     func hasObjectDistinguishesPresentFromMissing() throws {
         let root = try makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let repo = try GritRepository(path: root.path)
 
         let head = try repo.headSHA()
-        #expect(repo.hasObject(head))
+        #expect(try repo.hasObject(head))
 
         // Absence is an ordinary answer, so it must not throw and must not
         // consume the last-error slot the way a failure would.
         let absent = String(repeating: "0", count: 39) + "1"
-        #expect(!repo.hasObject(absent))
-        #expect(!repo.hasObject("not a sha"))
+        #expect(try !repo.hasObject(absent))
+
+        // A string that was never an object id is a different claim: not "the
+        // commit is gone" but "nobody could tell". Reporting it as absent is
+        // what made a reset refuse a commit that was sitting right there.
+        #expect(throws: (any Error).self) {
+            try repo.hasObject("not a sha")
+        }
     }
 
     @Test("restoring a file discards the edit")
