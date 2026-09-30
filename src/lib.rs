@@ -477,6 +477,42 @@ pub extern "C" fn grit_repo_reset_hard_to(repo: *mut Repository, sha: *const c_c
     guard_string(|| ops::reset_hard_to(repo, &sha))
 }
 
+/// 1 when the index describes exactly the tree HEAD already commits to, 0 when
+/// there is something staged, -1 on error. A guard against empty commits.
+#[no_mangle]
+pub extern "C" fn grit_repo_index_matches_head(repo: *mut Repository) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    match ops::staged_tree_matches_head(repo) {
+        Ok(same) => i32::from(same),
+        Err(error) => {
+            set_error(&error.to_string());
+            -1
+        }
+    }
+}
+
+/// Mixed reset to `sha`: move the ref and rebuild the index, work tree untouched.
+///
+/// The repair for an index that recorded modes the trees do not agree with.
+/// Returns a summary line, or NULL on error.
+#[no_mangle]
+pub extern "C" fn grit_repo_reset_mixed_to(repo: *mut Repository, sha: *const c_char) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(sha) = (unsafe { take_str(sha) }) else {
+        set_error("null sha");
+        return std::ptr::null_mut();
+    };
+    guard_string(|| ops::reset_mixed_to(repo, &sha))
+}
+
 /// Discard all work-tree changes; returns the restored HEAD sha or NULL.
 #[no_mangle]
 pub extern "C" fn grit_repo_force_checkout_head(repo: *mut Repository) -> *mut c_char {

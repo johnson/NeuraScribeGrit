@@ -17,6 +17,11 @@ struct GritBench {
             logMode(args)
             return
         }
+        if args.first == "filemode" {
+            args.removeFirst()
+            filemodeMode(args)
+            return
+        }
         if args.first == "diff" {
             args.removeFirst()
             diffMode(args)
@@ -147,6 +152,47 @@ struct GritBench {
         print("repo: \(path)  commits=\(commits.count)  files changed across them=\(totalFiles)")
         print(String(format: "  first pass  %8.1f ms total", coldTotal))
         print(String(format: "  same diff   %8.1f ms warm median", warm.medianMs))
+    }
+
+    /// Reproduces a whole-repository "mode changed" commit on purpose.
+    ///
+    /// A filesystem that reports an execute bit on every plain file will make
+    /// every tracked entry look like a mode change. git is told not to care via
+    /// core.filemode=false; this checks whether the flag is honoured, by
+    /// committing whatever the index holds and letting real git read the result.
+    static func filemodeMode(_ args: [String]) {
+        guard let path = args.first else {
+            print("usage: gritBench filemode <repo>")
+            return
+        }
+        let config = (try? String(contentsOfFile: path + "/.git/config", encoding: .utf8)) ?? ""
+        let setting = config
+            .components(separatedBy: "\n")
+            .first { $0.lowercased().contains("filemode") }?
+            .trimmingCharacters(in: .whitespaces) ?? "filemode unset"
+        print("config: \(setting)")
+
+        guard let repo = try? GritRepository(path: path) else {
+            print("cannot open \(path)")
+            return
+        }
+        let before = try? repo.headSHA()
+        let status = try? repo.status()
+        print("status files reported changed: \(status?.files.count ?? -1)")
+        if let files = status?.files, !files.isEmpty {
+            for file in files.prefix(5) {
+                print("  \(file.status) \(file.path)")
+            }
+        }
+
+        do {
+            try repo.stageAll()
+            let sha = try repo.commit(message: "probe: mode check", authorName: "probe", authorEmail: "probe@example.com")
+            print("committed: \(sha)")
+            print("head was:  \(before ?? "unborn")")
+        } catch {
+            print("commit failed: \(error)")
+        }
     }
 
     /// Where the first call's time goes, step by step, in one fresh process.

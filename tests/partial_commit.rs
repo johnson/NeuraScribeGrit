@@ -179,3 +179,67 @@ fn committing_a_path_that_is_not_staged_is_an_error() {
             .expect_err("a.txt is modified in the work tree but not staged");
     assert!(format!("{err:#}").contains("are staged"), "{err:#}");
 }
+
+/// Staging something that is not a change should be visible as such, so a
+/// caller can decline to commit. A file whose content is unchanged but whose
+/// timestamp moved is the everyday case: it reads as dirty, stages, and
+/// hashes to the blob the tree already holds.
+#[test]
+fn an_unchanged_file_stages_into_the_same_tree() {
+    let dir = repo_with(&[("note.md", "one\n")]);
+    let repo = ops::open(dir.path()).unwrap();
+
+    assert!(
+        ops::staged_tree_matches_head(&repo).unwrap(),
+        "a freshly committed repository stages to HEAD's own tree"
+    );
+
+    // Touch without changing: the content still matches.
+    let path = dir.path().join("note.md");
+    std::fs::write(&path, "one\n").unwrap();
+    ops::stage_file(&repo, "note.md").unwrap();
+    assert!(
+        ops::staged_tree_matches_head(&repo).unwrap(),
+        "rewriting a file with the same bytes must not read as a new tree"
+    );
+
+    // A real edit is a real change.
+    std::fs::write(&path, "two\n").unwrap();
+    ops::stage_file(&repo, "note.md").unwrap();
+    assert!(
+        !ops::staged_tree_matches_head(&repo).unwrap(),
+        "a different blob has to read as a change, or pulls stop committing WIP"
+    );
+}
+
+#[test]
+fn a_new_file_is_a_change_but_a_staged_deletion_of_a_missing_file_is_not() {
+    let dir = repo_with(&[("keep.md", "k\n"), ("drop.md", "d\n")]);
+    let repo = ops::open(dir.path()).unwrap();
+    assert!(ops::staged_tree_matches_head(&repo).unwrap());
+
+    std::fs::remove_file(dir.path().join("drop.md")).unwrap();
+    ops::stage_file(&repo, "drop.md").unwrap();
+    assert!(
+        !ops::staged_tree_matches_head(&repo).unwrap(),
+        "deleting a tracked file has to read as a change"
+    );
+
+    ops::commit(&repo, "wip", "T", "t@example.com").unwrap();
+    assert!(
+        ops::staged_tree_matches_head(&repo).unwrap(),
+        "and stops reading as one once it is committed"
+    );
+}
+
+#[test]
+fn an_unborn_head_never_matches() {
+    let dir = tempfile::tempdir().expect("temp");
+    git(dir.path(), &["init", "--initial-branch=main"]);
+    let repo = ops::open(dir.path()).unwrap();
+
+    assert!(
+        !ops::staged_tree_matches_head(&repo).unwrap(),
+        "a repository with no commits has nothing for a tree to equal; the first commit is never the empty one this guard is about"
+    );
+}

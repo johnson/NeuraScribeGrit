@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, diff_trees, unified_diff_histogram_with_prefix_and_funcname, DiffStatus};
+use grit_lib::config::ConfigSet;
 use grit_lib::index::{Index, IndexEntry, MODE_EXECUTABLE, MODE_REGULAR};
 use grit_lib::merge_base::{count_symmetric_ahead_behind, is_ancestor as grit_is_ancestor, merge_bases_octopus};
 use grit_lib::objects::{parse_commit, parse_tree, serialize_commit, CommitData, ObjectId, ObjectKind};
@@ -144,10 +145,11 @@ pub fn stage_all(repo: &Repository) -> Result<()> {
     for path in &model.untracked {
         touched.insert(path.clone());
     }
+    let filemode = core_filemode(repo);
     for rel in touched {
         let full = work_tree.join(&rel);
         if full.is_file() {
-            add_path(repo, &mut index, &full)?;
+            add_path(repo, &mut index, &full, filemode)?;
         }
     }
 
@@ -436,6 +438,91 @@ pub fn reset_hard_to(repo: &Repository, sha: &str) -> Result<String> {
     Ok(oid.to_string())
 }
 
+/// Mixed reset to `sha`: move the ref and rebuild the index, leaving the work tree alone.
+///
+/// The index is rebuilt from the target tree, so a recorded file mode that the
+/// tree does not agree with stops being carried forward. That is the repair for
+/// an index poisoned by a commit made on a filesystem whose execute bit cannot
+/// be trusted: the iPad recorded 100755 for all 9763 entries, and with
+/// `core.filemode=false` both status and add now ignore that bit, but the index
+/// keeps handing the wrong mode to the next commit until it is rebuilt.
+///
+/// Staged work is dropped, exactly as `git reset --mixed` does. Nothing in the
+/// work tree is read or written, so unstaged and untracked files are untouched.
+pub fn reset_mixed_to(repo: &Repository, sha: &str) -> Result<String> {
+    let oid: ObjectId = sha.parse().with_context(|| format!("bad commit {sha}"))?;
+    if !repo.odb.exists(&oid) {
+        bail!(
+            "commit {sha} is not in this repository; it was pruned, or it was made \
+             on another device that has not been fetched here"
+        );
+    }
+    let tree = commit_tree(repo, sha)?;
+    let work_tree = repo.work_tree.as_deref().context("bare repository has no work tree")?;
+
+    let mut index = repo.load_index()?;
+    let before = index.entries.len();
+    index.entries.clear();
+    let mut keep: BTreeSet<String> = BTreeSet::new();
+
+    for (rel, mode, entry_oid) in &flatten_tree(&repo.odb, tree)? {
+        if *mode == MODE_GITLINK {
+            let full = work_tree.join(rel);
+            let meta = fs::symlink_metadata(&full).ok();
+            let entry = match meta {
+                Some(meta) => make_index_entry(rel, *mode, *entry_oid, &meta),
+                None => make_gitlink_entry(rel, entry_oid, work_tree),
+            };
+            index.add_or_replace(entry);
+            keep.insert(rel.clone());
+            continue;
+        }
+        // The mode and object id come from the tree; only the cached stat data
+        // comes from disk, and a miss there just means the next status rehashes.
+        let stat = fs::symlink_metadata(work_tree.join(rel)).ok();
+        let entry = match stat {
+            Some(stat) => make_index_entry(rel, *mode, *entry_oid, &stat),
+            // No file on disk (deleted since, or a path the checkout never
+            // wrote): keep the tree's mode and id, and leave the cached stat
+            // data zeroed so the next status treats the entry as needing a look.
+            None => IndexEntry {
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                dev: 0,
+                ino: 0,
+                mode: *mode,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid: *entry_oid,
+                flags: 0,
+                flags_extended: None,
+                path: rel.as_bytes().to_vec(),
+                base_index_pos: 0,
+            },
+        };
+        index.add_or_replace(entry);
+        keep.insert(rel.clone());
+    }
+
+    write_index_clean(repo, &mut index)?;
+
+    let target = grit_lib::refs::read_head(&repo.git_dir)?.unwrap_or_else(|| "HEAD".to_string());
+    let previous = ref_value(repo, &target);
+    grit_lib::refs::write_ref(&repo.git_dir, &target, &oid)?;
+    append_reflog(
+        repo,
+        &target,
+        &previous,
+        &oid,
+        APP_REFLOG_IDENTITY,
+        &format!("reset (mixed): moving to {sha}"),
+    );
+    Ok(format!("{oid} ({before} -> {} entries)", index.entries.len()))
+}
+
 /// Put HEAD on `branch` pointing at `sha`, and materialise the work tree.
 ///
 /// HEAD is written as a symbolic ref rather than left detached, because a
@@ -514,11 +601,7 @@ pub fn stage_file(repo: &Repository, path: &str) -> Result<()> {
         return write_index_clean(repo, &mut index);
     }
 
-    let mode = if meta.permissions().mode() & 0o111 != 0 {
-        MODE_EXECUTABLE
-    } else {
-        MODE_REGULAR
-    };
+    let mode = staged_mode(&index, path, meta.permissions().mode(), core_filemode(repo));
     let data = fs::read(&full)?;
     let oid = repo.odb.write(ObjectKind::Blob, &data)?;
     index.add_or_replace(make_index_entry(path, mode, oid, &meta));
@@ -1004,6 +1087,42 @@ fn commit_tree(repo: &Repository, sha: &str) -> Result<ObjectId> {
     Ok(parse_commit(&object.data)?.tree)
 }
 
+/// Does the index describe exactly the tree HEAD already commits to?
+///
+/// The last check before making a commit, and the one that decides whether a
+/// commit is worth making at all. Staging is not the same as changing
+/// anything: a file can be dirty, get staged, and hash to the blob the tree
+/// already records -- a file whose only difference was a timestamp, a
+/// submodule pointer already at the recorded commit, a path whose mode the
+/// filesystem does not reliably report. The commit then has a tree equal to
+/// its parent's, which says nothing and lands in the history as noise.
+///
+/// False for an unborn HEAD: there is nothing to be equal to, and the first
+/// commit of a repository is never empty in the sense that matters here.
+/// False for a conflicted index, where a nonzero stage means a merge is
+/// unfinished rather than staged.
+pub fn staged_tree_matches_head(repo: &Repository) -> Result<bool> {
+    let Some(head) = head_sha(repo) else { return Ok(false) };
+    let head_tree = commit_tree(repo, &head)?;
+    let head_entries = flatten_tree(&repo.odb, head_tree)?;
+
+    let index = repo.load_index()?;
+    let mut staged: Vec<(String, u32, ObjectId)> = Vec::with_capacity(index.entries.len());
+    for entry in &index.entries {
+        // Stage lives in the flags word, bits 12-13; there is no field for it.
+        if (entry.flags >> 12) & 0x3 != 0 {
+            return Ok(false);
+        }
+        staged.push((
+            String::from_utf8_lossy(&entry.path).to_string(),
+            entry.mode,
+            entry.oid,
+        ));
+    }
+    staged.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(staged == head_entries)
+}
+
 fn parent_of(repo: &Repository, oid: &ObjectId) -> Result<Option<ObjectId>> {
     let object = repo.odb.read(oid)?;
     Ok(parse_commit(&object.data)?.parents.first().copied())
@@ -1093,7 +1212,39 @@ fn make_index_entry(path: &str, mode: u32, oid: ObjectId, stat: &fs::Metadata) -
 }
 
 /// Stage one work-tree file: write the blob, add the index entry.
-fn add_path(repo: &Repository, index: &mut Index, full: &Path) -> Result<()> {
+/// Whether the execute bit on disk is worth recording.
+///
+/// git's own `add` keeps the mode already in the index and falls back to 100644
+/// when this is false, because on such a filesystem the bit says nothing about
+/// the file. Reading it anyway turned every tracked file on the iPad into a mode
+/// change: 9762 of them in one commit, content untouched.
+fn core_filemode(repo: &Repository) -> bool {
+    ConfigSet::load(Some(&repo.git_dir), true)
+        .ok()
+        .and_then(|config| config.get_bool("core.filemode").and_then(|result| result.ok()))
+        .unwrap_or(true)
+}
+
+/// The mode to record for `rel`: what is on disk when the execute bit is
+/// trustworthy, otherwise whatever the index already said about it.
+fn staged_mode(index: &Index, rel: &str, on_disk: u32, filemode: bool) -> u32 {
+    if filemode {
+        if on_disk & 0o111 != 0 {
+            MODE_EXECUTABLE
+        } else {
+            MODE_REGULAR
+        }
+    } else {
+        // Prefer the higher unmerged stages first, matching git's add.
+        index
+            .get(rel.as_bytes(), 0)
+            .or_else(|| index.get(rel.as_bytes(), 2))
+            .or_else(|| index.get(rel.as_bytes(), 1))
+            .map_or(MODE_REGULAR, |entry| entry.mode)
+    }
+}
+
+fn add_path(repo: &Repository, index: &mut Index, full: &Path, filemode: bool) -> Result<()> {
     let work_tree = repo.work_tree.as_deref().context("bare repository")?;
     let rel = full
         .strip_prefix(work_tree.canonicalize()?)
@@ -1102,8 +1253,7 @@ fn add_path(repo: &Repository, index: &mut Index, full: &Path) -> Result<()> {
 
     let data = fs::read(full)?;
     let stat = fs::metadata(full)?;
-    let mode =
-        if stat.permissions().mode() & 0o111 != 0 { MODE_EXECUTABLE } else { MODE_REGULAR };
+    let mode = staged_mode(index, &rel, stat.permissions().mode(), filemode);
     let oid = repo.odb.write(ObjectKind::Blob, &data)?;
     index.add_or_replace(make_index_entry(&rel, mode, oid, &stat));
     Ok(())

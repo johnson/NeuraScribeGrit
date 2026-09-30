@@ -233,6 +233,15 @@ int32_t grit_repo_stage_file(GritRepoHandle *repo, const char *path);
 char *grit_repo_fast_forward_json(GritRepoHandle *repo, const char *tip);
 /* 0 on success, -1 on failure. */
 int32_t grit_repo_reset_file_to_head(GritRepoHandle *repo, const char *path);
+/* Mixed reset to a commit: move the ref and rebuild the index from its tree,
+ * leaving the work tree untouched. Summary line, or NULL. Free with grit_string_free. */
+char *grit_repo_reset_mixed_to(GritRepoHandle *repo, const char *sha);
+/* Recorded index modes as a JSON object keyed by octal mode; NULL on error. */
+char *grit_repo_index_modes_json(GritRepoHandle *repo);
+/* 1 when the index already describes HEAD's tree, 0 when something is staged,
+ * -1 on error (see grit_last_error). The guard against empty commits. */
+int32_t grit_repo_index_matches_head(GritRepoHandle *repo);
+
 char *grit_repo_reset_hard_to(GritRepoHandle *repo, const char *sha);
 char *grit_repo_force_checkout_head(GritRepoHandle *repo);
 char *grit_repo_list_remotes_json(GritRepoHandle *repo);

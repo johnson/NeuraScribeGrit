@@ -210,6 +210,38 @@ public final class GritRepository {
         try takeString { sha.withCString { grit_repo_reset_hard_to(handle, $0) } }
     }
 
+    /// Move HEAD to `sha` and rebuild the index from its tree, leaving the
+    /// working tree exactly as it is.
+    ///
+    /// The mode recorded for each path comes from the tree, which is what makes
+    /// this the repair for an index that picked up modes the trees never
+    /// agreed with. Staged work is dropped, as `git reset --mixed` does;
+    /// unstaged and untracked files are not touched.
+    @discardableResult
+    public func resetMixed(to sha: String) throws -> String {
+        try takeString { sha.withCString { grit_repo_reset_mixed_to(handle, $0) } }
+    }
+
+    /// Whether the index already describes the tree HEAD commits to.
+    ///
+    /// Staging is not the same as changing anything: a dirty file can be staged
+    /// and hash to the blob the tree already holds, and a submodule pointer can
+    /// already sit at its recorded commit. A commit made then would carry its
+    /// parent's tree, which records nothing and only adds noise to the history.
+    /// Callers use this to decline to commit at all.
+    ///
+    /// - Throws: if the repository cannot be read, or HEAD has no tree.
+    public func indexMatchesHead() throws -> Bool {
+        switch grit_repo_index_matches_head(handle) {
+        case 1:
+            return true
+        case 0:
+            return false
+        default:
+            throw GritError.failure()
+        }
+    }
+
     /// Whether this repository can still read the object named by the SHA.
     ///
     /// The app's history lists are built from commit hashes and can outlive the
