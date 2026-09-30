@@ -371,7 +371,22 @@ pub fn reset_hard_to(repo: &Repository, sha: &str) -> Result<String> {
     let mut keep: BTreeSet<String> = BTreeSet::new();
 
     for (rel, mode, entry_oid) in &entries {
-        let blob = repo.odb.read(entry_oid)?;
+        // A mode 160000 entry is a gitlink: a submodule pointer, not a file.
+        // Its object id names a commit in the *submodule's* repository, so it is
+        // not expected -- and for an uninitialized submodule, not present -- in
+        // this repository's object store. Git records the pointer and moves on;
+        // reading it here is what made a reset fail on any repository with a
+        // submodule the user never cloned. Whether the submodule is present or
+        // not is the user's business, so neither case may fail the reset.
+        if *mode == MODE_GITLINK {
+            index.add_or_replace(make_gitlink_entry(rel, entry_oid, work_tree));
+            keep.insert(rel.clone());
+            continue;
+        }
+
+        let blob = repo.odb
+            .read(entry_oid)
+            .with_context(|| format!("{rel} is missing from this repository"))?;
         let full = work_tree.join(rel);
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)?;
@@ -385,10 +400,17 @@ pub fn reset_hard_to(repo: &Repository, sha: &str) -> Result<String> {
         keep.insert(rel.clone());
     }
 
-    // Remove files the target commit does not contain.
+    // Remove files the target commit does not contain. Submodule directories
+    // are never removed: they hold the submodule's own checkout, which is not
+    // this repository's to delete, and `remove_dir_all` on one would be the
+    // single most destructive thing a reset could do.
     for rel in previous {
         if !keep.contains(&rel) {
-            let _ = fs::remove_file(work_tree.join(&rel));
+            let full = work_tree.join(&rel);
+            if full.is_dir() {
+                continue;
+            }
+            let _ = fs::remove_file(&full);
         }
     }
 
@@ -813,6 +835,36 @@ fn blob_at_head(repo: &Repository, path: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// Flatten a tree into (relative path, mode, oid), depth first, sorted by path.
+/// Mode git gives a submodule pointer in a tree entry.
+const MODE_GITLINK: u32 = 0o160000;
+
+/// Index entry for a submodule pointer.
+///
+/// The entry has to exist or the path reads as deleted. Its stat fields come
+/// from the submodule directory when there is one and are zero when there is
+/// not -- there is no file to stat in that case, and git tolerates the zeros
+/// because what it compares is the recorded gitlink id, not a timestamp.
+fn make_gitlink_entry(path: &str, oid: &ObjectId, work_tree: &std::path::Path) -> IndexEntry {
+    let stat = fs::metadata(work_tree.join(path)).ok();
+    IndexEntry {
+        ctime_sec: stat.as_ref().map_or(0, |s| s.ctime() as u32),
+        ctime_nsec: stat.as_ref().map_or(0, |s| s.ctime_nsec() as u32),
+        mtime_sec: stat.as_ref().map_or(0, |s| s.mtime() as u32),
+        mtime_nsec: stat.as_ref().map_or(0, |s| s.mtime_nsec() as u32),
+        dev: stat.as_ref().map_or(0, |s| s.dev() as u32),
+        ino: stat.as_ref().map_or(0, |s| s.ino() as u32),
+        mode: MODE_GITLINK,
+        uid: 0,
+        gid: 0,
+        oid: *oid,
+        size: 0,
+        flags: 0,
+        flags_extended: None,
+        path: path.as_bytes().to_vec(),
+        base_index_pos: 0,
+    }
+}
+
 fn flatten_tree(odb: &grit_lib::odb::Odb, tree: ObjectId) -> Result<Vec<(String, u32, ObjectId)>> {
     let mut out = Vec::new();
     let mut stack = vec![(String::new(), tree)];

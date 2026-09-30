@@ -168,3 +168,62 @@ fn an_absent_object_reads_as_absent_and_records_no_error() {
 
     unsafe { neurascribe_grit_ffi::grit_repo_free(repo) };
 }
+
+/// A submodule the user never cloned must not break a reset.
+///
+/// A mode 160000 tree entry names a commit in the *submodule's* repository, so
+/// it is not in this repository's object store and never will be until someone
+/// runs `git submodule update --init`. Git records the pointer and moves on.
+/// Reading it made every reset fail with a bare `object not found: <oid>` that
+/// named neither the commit the user asked for nor the path that is missing.
+#[test]
+fn reset_succeeds_with_an_uninitialized_submodule() {
+    let dir = tempfile::tempdir().expect("temp");
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.name", "Tester"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    std::fs::write(root.join("a.txt"), "a\n").expect("write");
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "first"]);
+
+    // Record a submodule pointer without ever fetching its contents, which is
+    // what `git submodule add` without `--init`, or a cloned repo whose
+    // submodules were never initialized, both leave behind.
+    let gitlink = "05bb052fa48750ec5917e11cb5e8de5044da3707";
+    git(root, &["update-index", "--add", "--cacheinfo", &format!("160000,{gitlink},sub/mod")]);
+    git(root, &["commit", "-q", "-m", "add submodule pointer"]);
+    let target = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    let path = c(root.to_str().expect("utf8"));
+    let repo = unsafe { neurascribe_grit_ffi::grit_repo_open(path.as_ptr()) };
+    assert!(!repo.is_null(), "grit_repo_open failed: {}", last_error());
+
+    let sha = c(&target);
+    let head = unsafe { neurascribe_grit_ffi::grit_repo_reset_hard_to(repo, sha.as_ptr()) };
+    assert!(
+        !head.is_null(),
+        "a reset must not fail over a submodule that was never cloned: {}",
+        last_error()
+    );
+    let text = unsafe { CStr::from_ptr(head) }.to_string_lossy().into_owned();
+    unsafe { neurascribe_grit_ffi::grit_string_free(head) };
+    assert_eq!(text, target, "HEAD must land on the commit that was asked for");
+    assert!(!last_error().contains("object not found"));
+
+    // The ordinary file still made it to the work tree.
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).expect("read"), "a\n");
+
+    unsafe { neurascribe_grit_ffi::grit_repo_free(repo) };
+}
