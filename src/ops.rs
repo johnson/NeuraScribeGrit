@@ -5,7 +5,8 @@
 //! operation (`status`). Everything else here is assembled from building blocks,
 //! following the recipes in the MIT-licensed `grit-cli` crate.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -18,7 +19,9 @@ use grit_lib::merge_base::{count_symmetric_ahead_behind, is_ancestor as grit_is_
 use grit_lib::objects::{parse_commit, parse_tree, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_lib::rev_list::{rev_list, OrderingMode, RevListOptions};
+use grit_lib::rev_list::resolve_revision_specs_to_commits;
+use grit_lib::rev_parse::load_graft_parents;
+use grit_lib::shallow::load_shallow_boundaries;
 use grit_lib::write_tree::{write_tree_from_index, write_tree_partial_from_index};
 
 use crate::types::{FileDiff, FileStatus, RemoteInfo, StatusResult};
@@ -736,47 +739,229 @@ pub struct CommitRecord {
 
 /// Commits reachable from HEAD, newest first, ordered by AUTHOR date.
 ///
-/// `OrderingMode::AuthorDateWalk` is git's `--author-date-order`, so the
-/// traversal matches what `git log --author-date-order` would produce. The
-/// plain `Default` mode would order by committer date, which is the thing we
-/// are deliberately not using.
-///
-/// `limit` truncates AFTER the sort, so the caller gets the newest `limit`
-/// commits rather than the first `limit` walked.
+/// See [`log_ranged`] for the ordering rule. `limit` 0 means no cap.
 pub fn log(repo: &Repository, limit: usize) -> Result<Vec<CommitRecord>> {
-    let options = RevListOptions {
-        ordering: OrderingMode::AuthorDateWalk,
-        ..Default::default()
-    };
-    let result = rev_list(repo, &["HEAD".to_string()], &[], &options)?;
+    Ok(log_ranged(repo, LogRange { limit, ..Default::default() })?.commits)
+}
 
-    let mut commits = Vec::with_capacity(result.commits.len());
-    for oid in &result.commits {
-        let object = repo.odb.read(oid)?;
-        if object.kind != ObjectKind::Commit {
-            continue;
+/// The window `log_ranged` is asked to return, in **author** time.
+///
+/// Both bounds are inclusive, which is what the Swift side has always applied
+/// and what `git log --since/--until` does at second resolution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LogRange {
+    /// Newest `limit` commits at most. 0 means "no cap", not "nothing".
+    pub limit: usize,
+    /// Inclusive lower bound (`--since`).
+    pub since: Option<i64>,
+    /// Inclusive upper bound (`--until`).
+    pub until: Option<i64>,
+}
+
+impl LogRange {
+    fn contains(&self, author_time: i64) -> bool {
+        if let Some(since) = self.since {
+            if author_time < since {
+                return false;
+            }
         }
-        let data = parse_commit(&object.data)?;
-        commits.push(CommitRecord {
-            hash: oid.to_string(),
-            author_time: identity_time(&data),
-            subject: subject_of(&data.message),
-            message: data.message.clone(),
-        });
+        if let Some(until) = self.until {
+            if author_time > until {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A log result plus what it cost to produce.
+///
+/// `objects_read` is the number of commit objects this walk actually opened.
+/// It is here because "the window is small" and "the walk stopped when it had
+/// enough" are different claims, and only the second one is a performance
+/// property: a caller that sees the whole history read for a seven-day window
+/// knows the early exit has regressed rather than assuming it worked.
+#[derive(Debug)]
+pub struct LogOutcome {
+    pub commits: Vec<CommitRecord>,
+    pub objects_read: usize,
+}
+
+/// Commits reachable from HEAD, newest first by AUTHOR date, restricted to a
+/// window and a count.
+///
+/// The ordering is git's `--author-date-order`: no parent is shown before all
+/// of its children, and otherwise commits come out by author timestamp, ties
+/// broken by the order they were discovered. Committer date is deliberately
+/// not used -- a rebase or an amend moves it while leaving the author's intent
+/// where it was.
+///
+/// The walk stops as soon as the answer cannot grow: once `limit` commits are
+/// in hand, or once the newest commit still queued is older than `since` and
+/// so is everything behind it. Only commits older than `since` can stop it,
+/// because they are the only ones whose parents cannot be newer than themselves
+/// in a walk that has already emitted them.
+///
+/// That bound is what makes this cheap. The caller usually wants the last few
+/// days of a notes repository that has been committed to for two years, and
+/// reaching the oldest commit means reading every object on the way -- on a
+/// device, cold, that is the difference between opening the history and waiting
+/// for it.
+///
+/// One caveat git shares: with skewed dates a commit's parent can be dated
+/// later than the child, and such a commit can be missed once the walk has
+/// passed `since`. Git's own `limit_list` makes the same trade.
+pub fn log_ranged(repo: &Repository, range: LogRange) -> Result<LogOutcome> {
+    let tips = resolve_revision_specs_to_commits(repo, &["HEAD".to_string()])
+        .with_context(|| "cannot resolve HEAD")?;
+    if tips.is_empty() {
+        // An unborn HEAD is an empty history, not an error: a repository with no
+        // commits yet is a state the app has to be able to show.
+        return Ok(LogOutcome { commits: Vec::new(), objects_read: 0 });
     }
 
-    // rev_list already returned author-date order, but sorting again makes the
-    // guarantee ours rather than the caller's, and keeps the Swift side from
-    // having to re-sort the whole history. Stable, so commits sharing an author
-    // timestamp keep walk order instead of shuffling between calls.
-    commits.sort_by(|a, b| b.author_time.cmp(&a.author_time));
-    // 0 means "no cap": the Swift side filters the range itself and passes 0
-    // when it does not know how many commits are in scope. truncate(0) would
-    // silently empty the result, so treat it as unlimited rather than literal.
-    if limit > 0 {
-        commits.truncate(limit);
+    // A shallow clone ends at its recorded boundaries, and grafts rewrite the
+    // parents outright. Both change what "reachable" means, and both are read
+    // once here rather than per commit.
+    let shallow = load_shallow_boundaries(&repo.git_dir);
+    let grafts = load_graft_parents(&repo.git_dir);
+
+    let mut seen: HashMap<ObjectId, Discovered> = HashMap::new();
+    let mut objects_read = 0usize;
+    let mut heap: BinaryHeap<WalkKey> = BinaryHeap::new();
+    let mut next_seq = 0u64;
+
+    for tip in tips {
+        discover(repo, tip, &range, &shallow, &grafts, &mut seen, &mut objects_read)?;
+        let Some(entry) = seen.get(&tip) else { continue };
+        heap.push(WalkKey { oid: tip, author_time: entry.author_time, seq: next_seq });
+        next_seq += 1;
     }
-    Ok(commits)
+
+    let mut commits: Vec<CommitRecord> = Vec::with_capacity(range.limit.min(64));
+    while let Some(next) = heap.peek() {
+        // The queue is ordered newest-first, so a head older than the lower
+        // bound means nothing left in it -- and nothing reachable through it --
+        // can be inside the window.
+        if let Some(since) = range.since {
+            if next.author_time < since {
+                break;
+            }
+        }
+        let key = heap.pop().expect("peeked a non-empty heap");
+        let Some(entry) = seen.get(&key.oid) else { continue };
+        let (parents, record) = (entry.parents.clone(), entry.record.clone());
+        if let Some(record) = record {
+            commits.push(record);
+            if range.limit > 0 && commits.len() >= range.limit {
+                break;
+            }
+        }
+        // Whether or not this commit was returned, its parents may be: a commit
+        // newer than `until` is filtered out of the answer but still leads
+        // history that is inside the window.
+        for parent in parents {
+            if seen.contains_key(&parent) {
+                continue;
+            }
+            discover(repo, parent, &range, &shallow, &grafts, &mut seen, &mut objects_read)?;
+            let Some(entry) = seen.get(&parent) else { continue };
+            heap.push(WalkKey { oid: parent, author_time: entry.author_time, seq: next_seq });
+            next_seq += 1;
+        }
+    }
+
+    Ok(LogOutcome { commits, objects_read })
+}
+
+/// Read one commit and remember what the walk and the answer both need.
+///
+/// The record is built only for a commit that is certain to be returned: the
+/// loop never discovers a commit after the limit has been reached, so "inside
+/// the window" at discovery time means "will be emitted".
+#[allow(clippy::too_many_arguments)]
+fn discover(
+    repo: &Repository,
+    oid: ObjectId,
+    range: &LogRange,
+    shallow: &HashSet<ObjectId>,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+    seen: &mut HashMap<ObjectId, Discovered>,
+    objects_read: &mut usize,
+) -> Result<()> {
+    if seen.contains_key(&oid) {
+        return Ok(());
+    }
+    let object = repo.odb.read(&oid).with_context(|| format!("cannot read commit {oid}"))?;
+    *objects_read += 1;
+    if object.kind != ObjectKind::Commit {
+        bail!("object {oid} is not a commit");
+    }
+    let data = parse_commit(&object.data)?;
+    let author_time = identity_time(&data);
+    let parents = match grafts.get(&oid) {
+        Some(replaced) => replaced.clone(),
+        None if shallow.contains(&oid) => Vec::new(),
+        None => data.parents.clone(),
+    };
+    let wanted = range.contains(author_time) && (range.limit == 0 || seen.len() < range.limit);
+    seen.insert(
+        oid,
+        Discovered {
+            author_time,
+            parents,
+            record: if wanted {
+                Some(CommitRecord {
+                    hash: oid.to_string(),
+                    author_time,
+                    subject: subject_of(&data.message),
+                    message: data.message,
+                })
+            } else {
+                None
+            },
+        },
+    );
+    Ok(())
+}
+
+/// What the walk learned about a commit the first time it read it.
+struct Discovered {
+    author_time: i64,
+    parents: Vec<ObjectId>,
+    /// Built only for a commit that is certain to be returned.
+    record: Option<CommitRecord>,
+}
+
+/// Queue key: the next commit to show is the newest, and among equally dated
+/// commits the one that was queued first.
+///
+/// `BinaryHeap` yields its greatest element, so the comparison reads the other
+/// way round from the rule it implements: a later `seq` must not outrank an
+/// earlier one.
+struct WalkKey {
+    oid: ObjectId,
+    author_time: i64,
+    seq: u64,
+}
+
+impl PartialEq for WalkKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.oid == other.oid
+    }
+}
+impl Eq for WalkKey {}
+impl PartialOrd for WalkKey {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for WalkKey {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.author_time
+            .cmp(&other.author_time)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
 }
 
 /// The epoch seconds in an identity line: `Name <email> 1700000000 +0800`.

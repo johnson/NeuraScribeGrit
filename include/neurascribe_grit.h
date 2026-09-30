@@ -202,6 +202,19 @@ char *grit_repo_diff_commit_json(GritRepoHandle *repo, const char *sha);
  *   [{"hash":…,"author_time":…,"subject":…,"message":…}]
  * author_time is epoch seconds. Free with grit_string_free. */
 char *grit_repo_log_json(GritRepoHandle *repo, size_t limit);
+/* The same walk bounded by an author-time window, so it can stop once the
+ * answer cannot grow instead of reading the whole history.
+ *   since_unix / until_unix are inclusive epoch seconds; pass GRIT_NO_LOWER_BOUND
+ *   / GRIT_NO_UPPER_BOUND for an open end. Both bounds together with limit
+ *   select the newest commits that satisfy them.
+ * Same JSON as grit_repo_log_json. Free with grit_string_free. */
+char *grit_repo_log_range_json(GritRepoHandle *repo, size_t limit,
+                               int64_t since_unix, int64_t until_unix);
+/* "No bound" markers for grit_repo_log_range_json. They are the values a
+ * range covering every possible instant already has, so passing them means
+ * exactly what leaving the bound out would. */
+#define GRIT_NO_LOWER_BOUND INT64_MIN
+#define GRIT_NO_UPPER_BOUND INT64_MAX
 char *grit_repo_changed_files_json(GritRepoHandle *repo, const char *base, const char *head);
 /* Resolve a ref name (or a raw SHA) to a commit SHA, as a JSON string.
  * Reads packed-refs as well as loose refs. Free with grit_string_free. */

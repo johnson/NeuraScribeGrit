@@ -330,6 +330,38 @@ pub extern "C" fn grit_repo_log_json(repo: *mut Repository, limit: usize) -> *mu
     let repo = unsafe { &*repo };
     guard_json(|| Ok(serde_json::to_value(ops::log(repo, limit)?)?))
 }
+
+/// Commits reachable from HEAD within an author-time window, newest first.
+///
+/// The window travels with the request so the walk can stop as soon as the
+/// answer cannot grow. `grit_repo_log_json` must read the entire history
+/// before it can return its first `limit` commits, which on a large repository
+/// means reading every commit object from disk to show the last few days of a
+/// timeline.
+///
+/// `since_unix` and `until_unix` are inclusive epoch seconds on the AUTHOR
+/// clock. GRIT_NO_LOWER_BOUND / GRIT_NO_UPPER_BOUND leave that end open, and
+/// `limit` 0 means no cap.
+#[no_mangle]
+pub extern "C" fn grit_repo_log_range_json(
+    repo: *mut Repository,
+    limit: usize,
+    since_unix: i64,
+    until_unix: i64,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let range = ops::LogRange {
+        limit,
+        since: (since_unix != i64::MIN).then_some(since_unix),
+        until: (until_unix != i64::MAX).then_some(until_unix),
+    };
+    guard_json(|| Ok(serde_json::to_value(ops::log_ranged(repo, range)?.commits)?))
+}
+
 /// Resolve a ref name (or a raw SHA) to a commit SHA, as JSON string.
 /// Frees the repo's ability to read packed-refs without the caller parsing it.
 #[no_mangle]

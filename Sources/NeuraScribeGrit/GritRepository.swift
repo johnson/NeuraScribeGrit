@@ -240,30 +240,44 @@ public final class GritRepository {
 
     /// Commits reachable from HEAD, newest first by **author** date.
     ///
-    /// The range is filtered here rather than in grit, because `since` / `until`
-    /// are author-time bounds and the shim only walks. `limit` is applied after
-    /// filtering, so a caller asking for "20 commits since Tuesday" gets 20
-    /// commits from Tuesday, not the first 20 walked and then thinned out.
+    /// The window goes to grit with the request. It used to be applied here,
+    /// after the shim had already walked the entire history and serialized every
+    /// commit in it -- so asking for the last seven days of a repository with
+    /// years of commits meant reading every one of those objects off disk to
+    /// keep twenty-odd of them. The shim now stops as soon as the answer cannot
+    /// grow, which is the difference between a timeline that opens and one that
+    /// does not.
+    ///
+    /// `limit` is applied after filtering, so a caller asking for "20 commits
+    /// since Tuesday" gets 20 commits from Tuesday, not the first 20 walked and
+    /// then thinned out.
     ///
     /// - Parameters:
     ///   - limit: maximum number of commits to return.
     ///   - since: drop commits authored before this instant.
     ///   - until: drop commits authored after this instant.
     public func log(limit: Int = 20, since: Date? = nil, until: Date? = nil) throws -> [GritCommit] {
-        // Ask for everything the walk finds, then filter, then cut. A capped
-        // walk would make `since` silently wrong whenever more than `limit`
-        // commits fall outside the window.
-        let walked = try decode([GritCommit].self) {
-            grit_repo_log_json(handle, 0)
+        let commits = try decode([GritCommit].self) {
+            grit_repo_log_range_json(
+                handle,
+                max(limit, 1),
+                Self.epochSeconds(since) ?? .min,
+                Self.epochSeconds(until) ?? .max
+            )
         }
-        return walked
-            .filter { commit in
-                if let since, commit.date < since { return false }
-                if let until, commit.date > until { return false }
-                return true
-            }
-            .prefix(max(limit, 1))
-            .map { $0 }
+        // The shim already applied the cap; this only guards the documented
+        // contract against a limit it did not receive.
+        return commits.prefix(max(limit, 1)).map { $0 }
+    }
+
+    /// Whole epoch seconds, which is the resolution the shim compares on.
+    ///
+    /// Fractional seconds are dropped rather than rounded: the shim filters on
+    /// the integer second it parsed out of the commit, so rounding here would
+    /// make a boundary instant mean something the walk cannot see.
+    private static func epochSeconds(_ date: Date?) -> Int64? {
+        guard let date else { return nil }
+        return Int64(date.timeIntervalSince1970.rounded(.down))
     }
 
     /// Resolve a ref name (or a raw SHA) to a commit SHA.
