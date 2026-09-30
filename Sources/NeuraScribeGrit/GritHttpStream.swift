@@ -15,12 +15,21 @@ import neurascribe_gritFFI
 /// thread its fetch is on; URLSession delivers on its own queue.
 final class GritHttpStreamBody: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let condition = NSCondition()
+
+    /// How often the reader wakes to re-check for data.
+    private static let readPollSeconds: TimeInterval = 5
+    /// How long the reader tolerates a quiet body before calling it a stall.
+    ///
+    /// Long enough to cover a server generating a pack without sending a byte,
+    /// short enough that a dead connection surfaces while someone can still see it.
+    private static let readStallSeconds: TimeInterval = 300
     private var pending = Data()
     private var finished = false
     private var failureBytes: [CChar] = []
     private var responseStatus: Int32 = 0
     private var responseSeen = false
     private var failed = false
+    private var received: Int = 0
     private var session: URLSession?
     private var task: URLSessionDataTask?
 
@@ -98,13 +107,29 @@ final class GritHttpStreamBody: NSObject, URLSessionDataDelegate, @unchecked Sen
     func read(into buf: UnsafeMutableRawPointer, cap: Int) -> Int {
         condition.lock()
         defer { condition.unlock() }
+        // A bounded wait, not an unbounded one. The server sends response
+        // headers and can then go quiet for a long time while it builds the
+        // pack; waiting forever turns that into a hang that reports nothing,
+        // which is worse than an error that says the transfer stalled.
+        var waited = 0.0
         while pending.isEmpty && !finished {
-            condition.wait()
+            if !condition.wait(until: Date(timeIntervalSinceNow: Self.readPollSeconds)) {
+                waited += Self.readPollSeconds
+                if waited >= Self.readStallSeconds {
+                    failed = true
+                    finished = true
+                    let stall = "stalled after \(Int(waited))s with \(received) bytes read"
+                    failureBytes = Array(stall.utf8.map { CChar(bitPattern: $0) }) + [0]
+                    print("[stream] \(stall)")
+                    return 0
+                }
+            }
         }
         let count = min(pending.count, max(cap, 0))
         if count > 0 {
             pending.copyBytes(to: buf.assumingMemoryBound(to: UInt8.self), count: count)
             pending.removeFirst(count)
+            received += count
         }
         return count
     }

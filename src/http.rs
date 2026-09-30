@@ -359,6 +359,12 @@ pub struct StreamBody {
     stream: RawStream,
     /// Set once the body has been closed, so the drop path is idempotent.
     closed: bool,
+    /// Diagnostics: how much came off the wire before the body ended,
+    /// and in how many reads. An early end is the difference between a
+    /// server that closed and a reader that gave up, and the error alone
+    /// does not say which.
+    chunks: u64,
+    bytes: u64,
 }
 
 impl StreamBody {
@@ -447,22 +453,23 @@ impl StreamBody {
 // shared across threads, only moved.
 unsafe impl Send for StreamBody {}
 
-impl Drop for StreamBody {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
 
 impl HttpBody for StreamBody {
     fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         if self.closed {
             return Ok(None);
         }
+        self.chunks += 1;
         let chunk = self.pull(64 * 1024)?;
+        self.bytes += chunk.len() as u64;
         if chunk.is_empty() {
             if let Some(failure) = self.failure() {
                 return Err(Error::Message(failure));
             }
+            eprintln!(
+                "[shim-stream] eof after {} chunks / {} bytes",
+                self.chunks, self.bytes
+            );
             return Ok(None);
         }
         Ok(Some(chunk))
@@ -585,7 +592,7 @@ impl HttpClient for CallbackHttpClient {
                     "the HTTP bridge could not start a streaming request".into(),
                 ));
             }
-            Ok(StreamBody { stream, closed: false })
+            Ok(StreamBody { stream, closed: false, chunks: 0, bytes: 0 })
         };
 
         let mut stream = attempt(cached.as_deref())?;
