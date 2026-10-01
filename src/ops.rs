@@ -610,6 +610,128 @@ pub fn stage_file(repo: &Repository, path: &str) -> Result<()> {
     write_index_clean(repo, &mut index)
 }
 
+/// Put `path` back to what HEAD records, leaving the work tree alone.
+///
+/// This is `git reset HEAD -- <path>`. The index entry is taken from HEAD
+/// rather than deleted, which is what makes the difference between a path
+/// that existed and one that did not: unstaging an edit must restore the old
+/// blob, while unstaging a new file must remove the entry entirely, or the
+/// file keeps showing up as staged.
+///
+/// The work tree is deliberately untouched. Unstaging is about what the next
+/// commit will contain, not about reverting work, so this never loses an
+/// edit.
+pub fn unstage_file(repo: &Repository, path: &str) -> Result<()> {
+    let head = head_sha(repo).ok_or_else(|| {
+        anyhow!("HEAD does not point at a commit yet, so there is nothing staged to unstage")
+    })?;
+    let tree = commit_tree(repo, &head)?;
+    let mut index = repo.load_index()?;
+
+    let in_head = flatten_tree(&repo.odb, tree)?
+        .into_iter()
+        .find(|(rel, _, _)| rel == path);
+
+    match in_head {
+        Some((_, mode, oid)) => {
+            clear_path_stages(&mut index, path);
+            // Always written with no stat data, never the work tree's.
+            //
+            // The stat fields are a cache that lets git skip hashing a file it
+            // believes it already has. Copying the work tree's timestamps in
+            // here looks tidier and is wrong: the entry then claims to be a
+            // verified copy of a blob the work tree no longer matches, so git
+            // skips the hash and reports an edited file as clean. Zeros say
+            // 'unknown, hash it', which costs one read of the one file the
+            // user just unstaged and is the only honest answer.
+            index.add_or_replace(make_index_entry_bare(path, mode, oid));
+        }
+        None => {
+            // Not in HEAD, so the entry is purely a staging of new content.
+            index.remove(path.as_bytes());
+        }
+    }
+
+    write_index_clean(repo, &mut index)
+}
+
+/// Replace HEAD's commit with a new one over the current index.
+///
+/// `git commit --amend`. The difference from `commit` is entirely in the
+/// parents: an amend keeps HEAD's parents and drops HEAD itself, so the
+/// result sits where HEAD was and the old commit becomes unreachable. Using
+/// HEAD as its own parent instead would fork the history and leave the
+/// previous commit still on the branch.
+pub fn amend_commit(
+    repo: &Repository,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<String> {
+    let head = head_sha(repo).ok_or_else(|| anyhow!("there is no commit to amend"))?;
+    let index = repo.load_index()?;
+    if index.entries.is_empty() {
+        bail!("nothing to commit (index is empty)");
+    }
+
+    let tree = write_tree_from_index(&repo.odb, &index, "")?;
+    let head_oid: ObjectId = head.parse().context("parse HEAD sha")?;
+    let object = repo.odb.read(&head_oid)?;
+    if object.kind != ObjectKind::Commit {
+        bail!("HEAD does not point at a commit");
+    }
+    // HEAD is never one of its own parents, so these carry over unchanged. A
+    // merge keeps both parents, which is what preserves it as a merge rather
+    // than quietly rewriting it into a single-parent commit.
+    let parents = parse_commit(&object.data)?.parents;
+
+    let ident = format_ident(author_name, author_email);
+    let commit = CommitData {
+        tree,
+        parents,
+        author: ident.clone(),
+        committer: ident.clone(),
+        author_raw: Vec::new(),
+        committer_raw: Vec::new(),
+        encoding: None,
+        message: format!("{}\n", message.trim_end()),
+        raw_message: None,
+    };
+    let oid = repo.odb.write(ObjectKind::Commit, &serialize_commit(&commit))?;
+
+    let target =
+        grit_lib::refs::read_head(&repo.git_dir)?.unwrap_or_else(|| "HEAD".to_string());
+    let previous = ref_value(repo, &target);
+    grit_lib::refs::write_ref(&repo.git_dir, &target, &oid)?;
+    append_reflog(repo, &target, &previous, &oid, &ident, &commit_reflog_message(message));
+    Ok(oid.to_string())
+}
+
+/// An index entry with no stat information, for a path with no work-tree file.
+///
+/// Zeros are the honest value rather than a fabricated timestamp: git reads
+/// them as "unknown, rehash this", which costs one hash and yields the right
+/// answer. Inventing a plausible stat would let git trust a stale cache and
+/// report an unstaged deletion as unchanged.
+pub(crate) fn make_index_entry_bare(path: &str, mode: u32, oid: ObjectId) -> IndexEntry {
+    IndexEntry {
+        ctime_sec: 0,
+        ctime_nsec: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid,
+        flags: (path.len().min(0xfff)) as u16,
+        flags_extended: None,
+        path: path.as_bytes().to_vec(),
+        base_index_pos: 0,
+    }
+}
 /// Fast-forward HEAD and the work tree to `tip`.
 ///
 /// Fails rather than merging when the histories have diverged, which is what

@@ -338,6 +338,34 @@ public final class GritRepository {
         }
     }
 
+
+    /// Unstage a single path, leaving the work tree untouched.
+    ///
+    /// - Throws: when HEAD has no commit yet, so nothing can be unstaged.
+    public func unstageFile(_ path: String) throws {
+        guard grit_repo_unstage_file(handle, path) == 0 else {
+            throw GritError.failure()
+        }
+    }
+
+    /// Replace HEAD's commit with one over the current index.
+    ///
+    /// - Throws: when there is no commit to amend, or the index is empty.
+    /// - Returns: the new commit SHA. The previous HEAD becomes unreachable.
+    @discardableResult
+    public func amendCommit(
+        message: String,
+        authorName: String? = nil,
+        authorEmail: String? = nil
+    ) throws -> String {
+        try message.withCString { text in
+            try (authorName ?? "NeuraScribe").withCString { name in
+                try (authorEmail ?? "app@neurascribe.local").withCString { email in
+                    try takeString { grit_repo_amend_commit(handle, text, name, email) }
+                }
+            }
+        }
+    }
     /// Fast-forward HEAD and the work tree to a commit.
     ///
     /// - Throws: when the histories have diverged. This never merges; the pull

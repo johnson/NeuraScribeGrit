@@ -254,6 +254,17 @@ char *grit_repo_list_files_json(GritRepoHandle *repo, const char *sha);
  * 0 on success, -1 on failure. */
 int32_t grit_repo_stage_file(GritRepoHandle *repo, const char *path);
 
+
+/* Unstage one path: put its index entry back to what HEAD records
+ * (git reset HEAD -- <path>). The work tree is left alone. 0 on success, -1 on
+ * failure. */
+int32_t grit_repo_unstage_file(GritRepoHandle *repo, const char *path);
+
+/* Replace HEAD's commit with one over the current index (git commit --amend);
+ * new commit as a JSON string. Fails when there is no commit to amend. Free
+ * with grit_string_free. */
+char *grit_repo_amend_commit(GritRepoHandle *repo, const char *message,
+                            const char *author_name, const char *author_email);
 /* Fast-forward HEAD and the work tree to a commit; new HEAD as a JSON string.
  * Fails when the histories have diverged. Free with grit_string_free. */
 char *grit_repo_fast_forward_json(GritRepoHandle *repo, const char *tip);

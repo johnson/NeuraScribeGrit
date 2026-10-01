@@ -493,6 +493,48 @@ pub extern "C" fn grit_repo_stage_file(repo: *mut Repository, path: *const c_cha
     guard_unit(|| ops::stage_file(repo, &path))
 }
 
+
+/// Unstage one path: put its index entry back to what HEAD records. The work
+/// tree is left alone. Fails when HEAD has no commit yet.
+#[no_mangle]
+pub extern "C" fn grit_repo_unstage_file(repo: *mut Repository, path: *const c_char) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    };
+    let repo = unsafe { &*repo };
+    let Some(path) = (unsafe { take_str(path) }) else {
+        set_error("null path");
+        return -1;
+    };
+    guard_unit(|| ops::unstage_file(repo, &path))
+}
+
+/// Replace HEAD's commit with one over the current index; returns the new
+/// commit as a JSON string. Fails when there is no commit to amend.
+#[no_mangle]
+pub extern "C" fn grit_repo_amend_commit(
+    repo: *mut Repository,
+    message: *const c_char,
+    author_name: *const c_char,
+    author_email: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(message) = (unsafe { take_str(message) }) else {
+        set_error("null message");
+        return std::ptr::null_mut();
+    };
+    let author_name = (unsafe { take_str(author_name) }).unwrap_or_default();
+    let author_email = (unsafe { take_str(author_email) }).unwrap_or_default();
+    guard_json(|| {
+        let sha = ops::amend_commit(repo, &message, &author_name, &author_email)?;
+        Ok(serde_json::to_value(sha)?)
+    })
+}
 /// Fast-forward HEAD and the work tree to a commit; returns the new HEAD as a
 /// JSON string. Fails when the histories have diverged.
 #[no_mangle]
