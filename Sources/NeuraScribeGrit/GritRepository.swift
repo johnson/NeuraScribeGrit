@@ -432,6 +432,55 @@ public final class GritRepository {
         guard ok >= 0 else { throw GritError.failure() }
         return Int(ok)
     }
+    // MARK: - Branches
+
+    /// Every local branch, sorted by name.
+    public func branches() throws -> [GritBranchInfo] {
+        try decode([GritBranchInfo].self) { grit_repo_list_branches_json(handle) }
+    }
+
+    /// Create `name` at `fromSHA` (HEAD when `nil`), returning its commit.
+    ///
+    /// Throws when the name is invalid or the branch already exists: this is
+    /// the one operation where overwriting would be the wrong default.
+    public func createBranch(named name: String, fromSHA: String? = nil) throws -> String {
+        // Two C strings, two lifetimes. The call happens inside both
+        // `withCString` closures; the string it returns is decoded afterwards,
+        // because `takeString` throws and the produce closure must not.
+        let start = fromSHA ?? ""
+        var raw: UnsafeMutablePointer<CChar>?
+        name.withCString { namePtr in
+            start.withCString { startPtr in
+                raw = grit_repo_create_branch(handle, namePtr, startPtr)
+            }
+        }
+        return try takeString { raw }
+    }
+
+    /// Switch to `name` and update the work tree.
+    ///
+    /// Unlike `git checkout` this does **not** carry uncommitted changes
+    /// across: grit has no three-way merge in the checkout path, so it would
+    /// silently drop half of them. It throws instead, leaving the work tree
+    /// and HEAD untouched.
+    public func checkoutBranch(_ name: String) throws -> String {
+        // Same shape as `createBranch`: the C string cannot outlive the
+        // `withCString` body, and `takeString` throws, so decoding happens
+        // after the pointer is handed back.
+        var raw: UnsafeMutablePointer<CChar>?
+        name.withCString { raw = grit_repo_checkout_branch_clean(handle, $0) }
+        return try takeString { raw }
+    }
+
+    /// Delete a local branch.
+    ///
+    /// - Parameter force: pass `true` to allow discarding unmerged commits.
+    ///   The current branch is refused either way.
+    public func deleteBranch(_ name: String, force: Bool) throws {
+        let result = name.withCString { grit_repo_delete_branch(handle, $0, force ? 1 : 0) }
+        guard result == 0 else { throw GritError.failure() }
+    }
+
     // MARK: - C plumbing
 
     /// The raw handle, for the network entry points in `GritNetwork`.

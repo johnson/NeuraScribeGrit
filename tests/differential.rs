@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use neurascribe_grit_ffi::ops;
+use neurascribe_grit_ffi::{ops, refs_ops};
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -458,3 +458,246 @@ fn executable_bit_survives_status_and_commit() {
     let mode = git(root, &["ls-tree", &sha, "run.sh"]).split(' ').next().unwrap_or("").to_string();
     assert_eq!(mode, "100755", "executable mode was lost");
 }
+
+// --- Branches ---------------------------------------------------------
+
+#[test]
+fn list_branches_matches_git() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    refs_ops::create_branch(&repo, "topic", None).unwrap();
+    refs_ops::create_branch(&repo, "older", Some(&ops::head_sha(&repo).unwrap())).unwrap();
+
+    let listed = refs_ops::list_branches(&repo).unwrap();
+    let names: Vec<&str> = listed.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, vec!["main", "older", "topic"], "not sorted by name");
+
+    let git_names: Vec<String> = git(root, &["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(names, git_names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
+    let head = listed.iter().find(|b| b.is_head).expect("a branch is HEAD");
+    assert_eq!(head.name, git(root, &["branch", "--show-current"]).trim());
+    assert_eq!(head.sha, git(root, &["rev-parse", "HEAD"]).trim());
+
+    // Every listed sha must be what git resolves for the same branch.
+    for branch in &listed {
+        assert_eq!(
+            branch.sha,
+            git(root, &["rev-parse", &format!("refs/heads/{}", branch.name)]).trim(),
+            "sha mismatch for {}",
+            branch.name
+        );
+    }
+}
+
+#[test]
+fn ahead_behind_matches_git() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    // The remote-tracking ref a real clone would have, plus tracking config
+    // for BOTH branches. Ahead/behind is defined against the upstream a
+    // branch tracks, so a branch with no tracking config has no counts to
+    // compare -- `git status` reports the same thing.
+    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(root, &["config", "branch.main.remote", "origin"]);
+    git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+
+    refs_ops::create_branch(&repo, "topic", None).unwrap();
+    git(root, &["config", "branch.topic.remote", "origin"]);
+    git(root, &["config", "branch.topic.merge", "refs/heads/main"]);
+
+    // One commit on main that topic does not have.
+    fs::write(root.join("notes/one.md"), "on main\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "main moves"]);
+    let main_sha = git(root, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // The remote moves to that commit too, so topic is now behind it. After
+    // topic's own commit below the two have genuinely diverged: one commit
+    // each way, which is the state ahead/behind exists to describe.
+    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+    // One commit on topic that the remote does not have (topic is ahead).
+    refs_ops::checkout_branch_clean(&repo, "topic").unwrap();
+    fs::write(root.join("notes/sub/two.md"), "on topic\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "topic moves"]);
+    refs_ops::checkout_branch_clean(&repo, "main").unwrap();
+
+    let listed = refs_ops::list_branches(&repo).unwrap();
+    let topic = listed.iter().find(|b| b.name == "topic").unwrap();
+    assert_eq!(topic.upstream.as_deref(), Some("refs/remotes/origin/main"));
+
+    let git_ahead: u32 = git(root, &["rev-list", "--count", "refs/remotes/origin/main..topic"])
+        .trim()
+        .parse()
+        .unwrap();
+    let git_behind: u32 = git(root, &["rev-list", "--count", "topic..refs/remotes/origin/main"])
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(git_ahead > 0 && git_behind > 0, "fixture should diverge");
+    assert_eq!(topic.ahead, git_ahead, "ahead mismatch");
+    assert_eq!(topic.behind, git_behind, "behind mismatch");
+    assert!(!topic.upstream_gone);
+
+    let main_branch = listed.iter().find(|b| b.name == "main").unwrap();
+    assert_eq!(main_branch.sha, main_sha);
+}
+
+#[test]
+fn tracking_that_does_not_resolve_is_reported_as_gone() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    // Configured upstream, but nothing was ever fetched.
+    git(root, &["config", "branch.main.remote", "origin"]);
+    git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+
+    let listed = refs_ops::list_branches(&repo).unwrap();
+    let main_branch = listed.iter().find(|b| b.name == "main").unwrap();
+    assert!(main_branch.upstream.is_some());
+    assert!(main_branch.upstream_gone, "missing upstream ref reported as in-sync");
+    assert_eq!(main_branch.ahead, 0);
+    assert_eq!(main_branch.behind, 0);
+}
+
+#[test]
+fn creating_a_branch_writes_a_ref_git_can_read() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+    let head = ops::head_sha(&repo).unwrap();
+
+    let sha = refs_ops::create_branch(&repo, "feature/x", Some(&head)).unwrap();
+    assert_eq!(sha, head);
+    assert_eq!(git(root, &["rev-parse", "refs/heads/feature/x"]).trim(), head);
+    assert_eq!(git(root, &["branch", "--show-current"]).trim(), "main", "HEAD moved on branch create");
+
+    let err = refs_ops::create_branch(&repo, "feature/x", None).unwrap_err().to_string();
+    assert!(err.contains("already exists"), "duplicate create was not refused: {err}");
+}
+
+#[test]
+fn invalid_branch_names_are_refused_without_writing_anything() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+    let before = refs_ops::list_branches(&repo).unwrap().len();
+
+    for bad in ["", "  ", "a..b", "bad name", "refs/heads/dup", "-flag", "x/"] {
+        let result = refs_ops::create_branch(&repo, bad, None);
+        assert!(result.is_err(), "accepted an invalid branch name {bad:?}");
+    }
+    assert_eq!(refs_ops::list_branches(&repo).unwrap().len(), before);
+}
+
+#[test]
+fn checkout_switches_branch_and_work_tree() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    refs_ops::create_branch(&repo, "topic", None).unwrap();
+    refs_ops::checkout_branch_clean(&repo, "topic").unwrap();
+
+    assert_eq!(ops::current_branch(&repo).unwrap(), "topic");
+    assert_eq!(git(root, &["branch", "--show-current"]).trim(), "topic");
+    // The commit the branch points at is the one on disk.
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), "line one\nline two changed\n");
+
+    let err = refs_ops::checkout_branch_clean(&repo, "nope").unwrap_err().to_string();
+    assert!(err.contains("does not exist"), "missing branch was not reported: {err}");
+}
+
+#[test]
+fn checkout_refuses_to_discard_uncommitted_work() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    refs_ops::create_branch(&repo, "topic", None).unwrap();
+    refs_ops::checkout_branch_clean(&repo, "topic").unwrap();
+
+    // Uncommitted edit, plus a commit on topic so the branches differ.
+    fs::write(root.join("notes/one.md"), "work in progress\n").unwrap();
+    ops::stage_all(&repo).unwrap();
+    ops::commit(&repo, "topic commit", "NeuraScribe", "app@neurascribe.local").unwrap();
+    refs_ops::checkout_branch_clean(&repo, "main").unwrap();
+    fs::write(root.join("notes/one.md"), "uncommitted again\n").unwrap();
+
+    let err = refs_ops::checkout_branch_clean(&repo, "topic").unwrap_err().to_string();
+    assert!(err.contains("uncommitted"), "dirty switch was not refused: {err}");
+    assert_eq!(ops::current_branch(&repo).unwrap(), "main", "HEAD moved despite the refusal");
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), "uncommitted again\n");
+
+    // Staged-but-uncommitted is the same hazard and is refused too.
+    ops::stage_all(&repo).unwrap();
+    assert!(refs_ops::checkout_branch_clean(&repo, "topic").is_err());
+}
+
+#[test]
+fn checkout_refuses_to_overwrite_an_untracked_file() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    refs_ops::create_branch(&repo, "topic", None).unwrap();
+    fs::write(root.join("notes/brand-new.md"), "only on topic\n").unwrap();
+    ops::stage_all(&repo).unwrap();
+    ops::commit(&repo, "add a file", "NeuraScribe", "app@neurascribe.local").unwrap();
+    refs_ops::checkout_branch_clean(&repo, "main").unwrap();
+
+    // A different untracked file at the same path as the branch has tracked.
+    fs::write(root.join("notes/brand-new.md"), "precious, not committed\n").unwrap();
+    let err = refs_ops::checkout_branch_clean(&repo, "topic").unwrap_err().to_string();
+    assert!(err.contains("brand-new.md"), "collision was not reported: {err}");
+    assert_eq!(fs::read_to_string(root.join("notes/brand-new.md")).unwrap(), "precious, not committed\n");
+}
+
+#[test]
+fn deleting_a_branch_follows_git_rules() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    refs_ops::create_branch(&repo, "merged", None).unwrap();
+    refs_ops::delete_branch(&repo, "merged", false).unwrap();
+    assert!(refs_ops::list_branches(&repo).unwrap().iter().all(|b| b.name != "merged"));
+
+    // Unmerged work needs force.
+    refs_ops::create_branch(&repo, "unmerged", None).unwrap();
+    refs_ops::checkout_branch_clean(&repo, "unmerged").unwrap();
+    fs::write(root.join("notes/one.md"), "only here\n").unwrap();
+    ops::stage_all(&repo).unwrap();
+    let orphan = ops::commit(&repo, "orphan", "NeuraScribe", "app@neurascribe.local").unwrap();
+    refs_ops::checkout_branch_clean(&repo, "main").unwrap();
+
+    let err = refs_ops::delete_branch(&repo, "unmerged", false).unwrap_err().to_string();
+    assert!(err.contains("not fully merged"), "unmerged delete was not refused: {err}");
+    refs_ops::delete_branch(&repo, "unmerged", true).unwrap();
+    assert!(refs_ops::list_branches(&repo).unwrap().iter().all(|b| b.name != "unmerged"));
+    // The commits were only discarded from the ref, not from the object store.
+    assert!(ops::resolve_ref(&repo, &orphan).is_ok());
+}
+
+#[test]
+fn deleting_the_current_branch_is_refused() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    let err = refs_ops::delete_branch(&repo, "main", true).unwrap_err().to_string();
+    assert!(err.contains("current branch"), "HEAD branch delete was not refused: {err}");
+    assert_eq!(ops::current_branch(&repo).unwrap(), "main");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), ops::head_sha(&repo).unwrap());
+}
+

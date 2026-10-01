@@ -220,6 +220,32 @@ char *grit_repo_changed_files_json(GritRepoHandle *repo, const char *base, const
  * Reads packed-refs as well as loose refs. Free with grit_string_free. */
 char *grit_repo_resolve_ref(GritRepoHandle *repo, const char *refname);
 
+/* --- Branches ------------------------------------------------------- */
+
+/* Local branches as a JSON array of objects:
+ * { "name", "sha", "isHead", "upstream", "ahead", "behind", "upstreamGone" }.
+ * `upstream` is a full ref (refs/remotes/...) or null when the branch has no
+ * tracking configuration; `upstreamGone` marks tracking that does not resolve
+ * locally. Branches are sorted by name. Free with grit_string_free. */
+char *grit_repo_list_branches_json(GritRepoHandle *repo);
+
+/* Create `name` at `from_sha`; pass NULL or "" for HEAD. Fails when the branch
+ * already exists or the start point is not an object. Returns the new sha as a
+ * JSON string, or NULL with the reason in grit_last_error. */
+char *grit_repo_create_branch(GritRepoHandle *repo, const char *name,
+                              const char *from_sha);
+
+/* Switch to an existing branch and update the work tree, returning the new HEAD
+ * sha. Refuses (NULL) when the work tree has uncommitted changes or when the
+ * switch would overwrite an untracked file -- this checkout does not carry
+ * local modifications across, so it never discards them either. */
+char *grit_repo_checkout_branch_clean(GritRepoHandle *repo, const char *name);
+
+/* Delete a local branch. `force` non-zero allows discarding unmerged commits.
+ * Always refuses to delete the current branch. Returns 0 on success, -1 on
+ * failure with the reason in grit_last_error. */
+int grit_repo_delete_branch(GritRepoHandle *repo, const char *name, int force);
+
 /* Every tracked path at a commit, as a JSON array of repo-relative sorted
  * paths (git ls-tree -r). Free with grit_string_free. */
 char *grit_repo_list_files_json(GritRepoHandle *repo, const char *sha);

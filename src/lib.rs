@@ -13,6 +13,7 @@ pub mod index_ops;
 pub mod net;
 pub mod ops;
 pub mod progress;
+pub mod refs_ops;
 pub mod submodules;
 pub mod types;
 
@@ -134,7 +135,7 @@ pub extern "C" fn grit_repo_has_object(repo: *mut Repository, sha: *const c_char
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let Some(sha) = (unsafe { take_str(sha) }) else {
         set_error("null sha");
@@ -221,7 +222,7 @@ pub extern "C" fn grit_repo_stage_all(repo: *mut Repository) -> i32 {
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     guard_unit(|| ops::stage_all(repo))
 }
@@ -378,6 +379,87 @@ pub extern "C" fn grit_repo_resolve_ref(repo: *mut Repository, refname: *const c
     guard_json(|| Ok(serde_json::to_value(ops::resolve_ref(repo, &refname)?)?))
 }
 
+/// Local branches as a JSON array of `{name, sha, isHead, upstream, ahead,
+/// behind, upstreamGone}`.
+#[no_mangle]
+pub extern "C" fn grit_repo_list_branches_json(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_json(|| Ok(serde_json::to_value(refs_ops::list_branches(repo)?)?))
+}
+
+/// Create a branch at `from_sha` (NULL or empty for HEAD) and return its sha.
+#[no_mangle]
+pub extern "C" fn grit_repo_create_branch(
+    repo: *mut Repository,
+    name: *const c_char,
+    from_sha: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(name) = (unsafe { take_str(name) }) else {
+        set_error("null name");
+        return std::ptr::null_mut();
+    };
+    let from = (unsafe { take_str(from_sha) }).filter(|s| !s.is_empty());
+    guard_string(|| refs_ops::create_branch(repo, &name, from.as_deref()))
+}
+
+/// Switch to an existing branch. Refuses when the work tree has uncommitted
+/// changes rather than overwriting them; the reason comes back through
+/// `grit_last_error`.
+#[no_mangle]
+pub extern "C" fn grit_repo_checkout_branch_clean(
+    repo: *mut Repository,
+    name: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(name) = (unsafe { take_str(name) }) else {
+        set_error("null name");
+        return std::ptr::null_mut();
+    };
+    guard_string(|| refs_ops::checkout_branch_clean(repo, &name))
+}
+
+/// Delete a local branch. `force` is non-zero to allow discarding unmerged
+/// commits. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn grit_repo_delete_branch(
+    repo: *mut Repository,
+    name: *const c_char,
+    force: i32,
+) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    };
+    let repo = unsafe { &*repo };
+    let Some(name) = (unsafe { take_str(name) }) else {
+        set_error("null name");
+        return -1;
+    };
+    match refs_ops::delete_branch(repo, &name, force != 0) {
+        Ok(()) => {
+            clear_error();
+            0
+        }
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            -1
+        }
+    }
+}
+
 /// Every tracked path at a commit, as a JSON array of repo-relative paths.
 #[no_mangle]
 pub extern "C" fn grit_repo_list_files_json(repo: *mut Repository, sha: *const c_char) -> *mut c_char {
@@ -400,7 +482,7 @@ pub extern "C" fn grit_repo_stage_file(repo: *mut Repository, path: *const c_cha
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let Some(path) = (unsafe { take_str(path) }) else {
         set_error("null path");
@@ -453,7 +535,7 @@ pub extern "C" fn grit_repo_reset_file_to_head(repo: *mut Repository, path: *con
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let Some(path) = (unsafe { take_str(path) }) else {
         set_error("null path");
@@ -484,7 +566,7 @@ pub extern "C" fn grit_repo_index_matches_head(repo: *mut Repository) -> i32 {
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     match ops::staged_tree_matches_head(repo) {
         Ok(same) => i32::from(same),
@@ -541,7 +623,7 @@ pub extern "C" fn grit_repo_ahead_count(repo: *mut Repository, remote_tip: *cons
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let Some(tip) = (unsafe { take_str(remote_tip) }) else {
         set_error("null remote tip");
@@ -566,7 +648,7 @@ pub extern "C" fn grit_repo_is_ancestor(
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let (a, b) = match (unsafe { take_str(a) }, unsafe { take_str(b) }) {
         (Some(a), Some(b)) => (a, b),
@@ -861,7 +943,7 @@ pub unsafe extern "C" fn grit_repo_record_submodule(
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let (Some(name), Some(path), Some(url), Some(sha)) = (
         unsafe { take_str(name) },
@@ -884,7 +966,7 @@ pub unsafe extern "C" fn grit_repo_remove_submodule(
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let Some(path) = (unsafe { take_str(path) }) else {
         set_error("null path");
@@ -945,7 +1027,7 @@ pub unsafe extern "C" fn grit_repo_untrack_directory(
     if repo.is_null() {
         set_error("null repo");
         return -1;
-    }
+    };
     let repo = unsafe { &*repo };
     let Some(directory) = (unsafe { take_str(directory) }) else {
         set_error("null directory");

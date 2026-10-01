@@ -51,6 +51,28 @@ pub struct RemoteInfo {
     pub url: String,
 }
 
+/// One local branch.
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchInfo {
+    /// Short name, without the `refs/heads/` prefix.
+    pub name: String,
+    /// Commit the branch points at.
+    pub sha: String,
+    /// True when HEAD currently points at this branch.
+    pub is_head: bool,
+    /// Full upstream ref (`refs/remotes/...` or `refs/heads/...`), when the
+    /// branch has tracking configuration.
+    pub upstream: Option<String>,
+    /// Commits on the branch but not on its upstream.
+    pub ahead: u32,
+    /// Commits on the upstream but not on the branch.
+    pub behind: u32,
+    /// Tracking is configured but the upstream ref does not resolve locally
+    /// (never fetched, or the remote was deleted). Kept separate from
+    /// `upstream == nil`, which means "no tracking configured at all".
+    pub upstream_gone: bool,
+}
+
 /// Credentials the app already holds for a remote.
 ///
 /// grit would normally consult a `credential.helper`, but that is a subprocess

@@ -153,3 +153,57 @@ public struct GritSubmoduleInfo: Codable, Hashable, Sendable {
         case headSha = "head_sha"
     }
 }
+/// One local branch.
+public struct GritBranchInfo: Codable, Hashable, Sendable, Identifiable {
+    public let name: String
+    public let sha: String
+    public let isHead: Bool
+    public let upstream: String?
+    public let ahead: Int
+    public let behind: Int
+    public let upstreamGone: Bool
+
+    public var id: String { name }
+
+    /// The shim serializes with serde's default snake_case; without this every
+    /// decode throws and the caller silently sees an empty list.
+    enum CodingKeys: String, CodingKey {
+        case name, sha, upstream, ahead, behind
+        case isHead = "is_head"
+        case upstreamGone = "upstream_gone"
+    }
+
+    /// Short upstream name to show, or `nil` when there is nothing to show.
+    ///
+    /// `refs/remotes/origin/main` reads as `origin/main`; the full ref is an
+    /// implementation detail of the ref store, not something to put in a menu.
+    public var upstreamLabel: String? {
+        guard let upstream else { return nil }
+        if upstream.hasPrefix("refs/remotes/") {
+            return String(upstream.dropFirst("refs/remotes/".count))
+        }
+        if upstream.hasPrefix("refs/heads/") {
+            return String(upstream.dropFirst("refs/heads/".count))
+        }
+        return upstream
+    }
+
+    public init(
+        name: String,
+        sha: String,
+        isHead: Bool,
+        upstream: String?,
+        ahead: Int,
+        behind: Int,
+        upstreamGone: Bool
+    ) {
+        self.name = name
+        self.sha = sha
+        self.isHead = isHead
+        self.upstream = upstream
+        self.ahead = ahead
+        self.behind = behind
+        self.upstreamGone = upstreamGone
+    }
+}
+
