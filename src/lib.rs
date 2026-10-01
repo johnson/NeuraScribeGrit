@@ -14,6 +14,7 @@ pub mod net;
 pub mod ops;
 pub mod progress;
 pub mod refs_ops;
+pub mod merge_ops;
 pub mod stash_ops;
 pub mod submodules;
 pub mod types;
@@ -1085,7 +1086,7 @@ pub extern "C" fn grit_repo_stash_push(
     let repo = unsafe { &*repo };
     // A null message means "none given", which is what an optional Swift
     // String bridges to; an empty string is a real (empty) message.
-    let message: Option<String> = (unsafe { take_str(message) });
+    let message: Option<String> = unsafe { take_str(message) };
     guard_string(move || {
         stash_ops::push(repo, message.as_deref(), include_untracked != 0)
             .map_err(anyhow::Error::from)
@@ -1132,5 +1133,77 @@ pub extern "C" fn grit_repo_stash_drop(repo: *mut Repository, selector: *const c
         return -1;
     };
     guard_unit(move || stash_ops::drop(repo, &selector))
+}
+
+
+// --------------------------------------------------------------- merge
+
+/// Merge `spec` (a branch name or commit id) into the current branch.
+///
+/// Returns JSON describing what happened, because the four outcomes are not
+/// the same thing to a caller: a no-op, a fast-forward, a commit, and a set of
+/// conflicts that the user still has to resolve.
+#[no_mangle]
+pub extern "C" fn grit_repo_merge_json(
+    repo: *mut Repository,
+    spec: *const c_char,
+    message: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let Some(spec) = (unsafe { take_str(spec) }) else {
+        set_error("null refspec");
+        return std::ptr::null_mut();
+    };
+    let message = unsafe { take_str(message) };
+    guard_json(move || {
+        serde_json::to_value(merge_ops::merge(repo, &spec, message.as_deref())?)
+            .map_err(anyhow::Error::from)
+    })
+}
+
+/// Paths still carrying conflict markers in the index.
+#[no_mangle]
+pub extern "C" fn grit_repo_merge_conflicts_json(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_json(move || {
+        Ok(serde_json::json!({
+            "in_progress": merge_ops::merge_in_progress(repo),
+            "unresolved": merge_ops::unresolved_paths(repo)?,
+        }))
+    })
+}
+
+/// Commit the merge once the conflicts are resolved. Returns the new commit id.
+#[no_mangle]
+pub extern "C" fn grit_repo_merge_finish(
+    repo: *mut Repository,
+    message: *const c_char,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    let message = unsafe { take_str(message) };
+    guard_string(move || merge_ops::finish_merge(repo, message.as_deref()))
+}
+
+/// Throw the merge away and go back to where the branch was.
+#[no_mangle]
+pub extern "C" fn grit_repo_merge_abort(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_string(move || merge_ops::abort_merge(repo))
 }
 

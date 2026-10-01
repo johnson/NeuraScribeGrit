@@ -326,6 +326,21 @@ char *grit_repo_indexed_paths_under_json(GritRepoHandle *repo, const char *direc
 /// Stop tracking everything under a directory, leaving the files on disk
 /// (git rm -r --cached). Returns entries removed, or -1 on failure.
 int32_t grit_repo_untrack_directory(GritRepoHandle *repo, const char *directory);
+
+/* ---- merge (git merge / --continue / --abort) ---- */
+
+/* JSON: {"kind":"FastForward"|"Merged"|"Conflicted"|"UpToDate", ...}.
+   Conflicted carries "files": the paths that need resolving. */
+char *grit_repo_merge_json(GritRepoHandle *repo, const char *spec, const char *message);
+
+/* JSON: {"in_progress":bool,"unresolved":[path,...]} */
+char *grit_repo_merge_conflicts_json(GritRepoHandle *repo);
+
+/* Both return the new commit id. Both refuse when there is nothing to do or
+   when conflicts remain. */
+char *grit_repo_merge_finish(GritRepoHandle *repo, const char *message);
+char *grit_repo_merge_abort(GritRepoHandle *repo);
+
 #ifdef __cplusplus
 }
 #endif

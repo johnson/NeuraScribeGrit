@@ -7,7 +7,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use neurascribe_grit_ffi::{ops, refs_ops, stash_ops};
+use neurascribe_grit_ffi::types::MergeOutcome;
+use neurascribe_grit_ffi::{merge_ops, ops, refs_ops, stash_ops};
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -1046,5 +1047,291 @@ fn dropping_the_middle_of_a_stack_leaves_the_right_two() {
     // The surviving stack still applies: the deletion did not corrupt it.
     stash_ops::pop(&repo, "stash@{1}").expect("pop the older survivor");
     assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), "one\n");
+}
+
+
+// ---------------------------------------------------------------- merge
+
+/// Two branches that both changed the same line differently: the shape a
+/// conflict has in practice.
+fn diverged() -> TempDir {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["checkout", "-q", "-b", "topic"]);
+    fs::write(root.join("notes/one.md"), "line one\ntopic version\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "topic edit"]);
+    git(root, &["checkout", "-q", "main"]);
+    fs::write(root.join("notes/one.md"), "line one\nmain version\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "main edit"]);
+    dir
+}
+
+/// Two branches touching different files, so the merge is clean.
+fn clean_pair() -> TempDir {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["checkout", "-q", "-b", "topic"]);
+    fs::write(root.join("notes/topic.md"), "from topic\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "topic file"]);
+    git(root, &["checkout", "-q", "main"]);
+    fs::write(root.join("notes/mainonly.md"), "from main\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "main file"]);
+    dir
+}
+
+#[test]
+fn merging_an_ancestor_reports_up_to_date() {
+    let dir = diverged();
+    let root = dir.path();
+    // `behind` is a branch cut from an older main, so it sits strictly inside HEAD.
+    git(root, &["branch", "behind", "HEAD~1"]);
+    let main_tip = git(root, &["rev-parse", "main"]);
+
+    let repo = ops::open(root).expect("grit opens the repo");
+    let outcome = merge_ops::merge(&repo, "behind", None);
+    assert!(matches!(outcome, Ok(MergeOutcome::UpToDate)), "{outcome:?}");
+    // Nothing moved and nothing was written: this is not an error, it is a no-op.
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), main_tip.trim());
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert_eq!(
+        fs::read_to_string(root.join("notes/one.md")).unwrap(),
+        "line one
+main version
+"
+    );
+
+    // Merging a branch into itself is also a no-op, not a self-merge commit.
+    let same = merge_ops::merge(&repo, "main", None);
+    assert!(matches!(same, Ok(MergeOutcome::UpToDate)), "{same:?}");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn merging_a_descendant_fast_forwards() {
+    let dir = diverged();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+    let topic_tip = git(root, &["rev-parse", "topic"]);
+
+    git(root, &["reset", "-q", "--hard", "HEAD~1"]);
+    let outcome = merge_ops::merge(&repo, "topic", None).expect("merge");
+    assert!(matches!(outcome, MergeOutcome::FastForward { .. }), "{outcome:?}");
+    // HEAD moved to the other tip, and no merge commit was made.
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), topic_tip.trim());
+    assert_eq!(git(root, &["branch", "--show-current"]).trim(), "main");
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), "line one\ntopic version\n");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_clean_merge_makes_a_two_parent_commit() {
+    let dir = clean_pair();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    let outcome = merge_ops::merge(&repo, "topic", None).expect("merge");
+    let MergeOutcome::Merged { head } = outcome else {
+        panic!("expected a merge commit, got {outcome:?}");
+    };
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), head);
+
+    // Two parents: ours and theirs.
+    let shown = git(root, &["cat-file", "-p", "HEAD"]);
+    assert_eq!(shown.lines().filter(|l| l.starts_with("parent ")).count(), 2);
+    // The subject follows the git shape.
+    let subject = git(root, &["log", "-1", "--format=%s"]);
+    assert!(subject.contains("Merge branch"), "{subject}");
+    assert!(subject.contains("topic"), "{subject}");
+
+    // Both files are on disk, and the tree agrees with the work tree.
+    assert!(root.join("notes/topic.md").exists());
+    assert!(root.join("notes/mainonly.md").exists());
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    let ours = ops::list_files(&repo, &head).unwrap().len();
+    let theirs = git(root, &["ls-tree", "-r", "--name-only", "HEAD"]).lines().count();
+    assert_eq!(ours, theirs);
+}
+
+#[test]
+fn a_merge_message_replaces_the_default_subject() {
+    let dir = clean_pair();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    merge_ops::merge(&repo, "topic", Some("folding the topic in")).expect("merge");
+    assert_eq!(git(root, &["log", "-1", "--format=%s"]).trim(), "folding the topic in");
+}
+
+#[test]
+fn a_conflicting_merge_leaves_the_repository_mid_merge() {
+    let dir = diverged();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+    let main_before = git(root, &["rev-parse", "HEAD"]);
+
+    let outcome = merge_ops::merge(&repo, "topic", None).expect("merge");
+    let MergeOutcome::Conflicted { head, files } = outcome else {
+        panic!("expected a conflict, got {outcome:?}");
+    };
+    assert_eq!(files, vec!["notes/one.md".to_string()]);
+    // HEAD has not moved: there is no commit to point at yet.
+    assert_eq!(head, main_before.trim());
+    assert_eq!(merge_ops::unresolved_paths(&repo).unwrap(), vec!["notes/one.md".to_string()]);
+    assert!(merge_ops::merge_in_progress(&repo));
+
+    // git agrees the repository is mid-merge and names the same file.
+    assert!(root.join(".git/MERGE_HEAD").exists(), "git looks for this file too");
+    assert_eq!(git(root, &["diff", "--name-only", "--diff-filter=U"]), "notes/one.md\n");
+
+    // The work tree holds conflict markers naming both sides.
+    let content = fs::read_to_string(root.join("notes/one.md")).unwrap();
+    assert!(content.contains("<<<<<<<"), "no markers written: {content}");
+    assert!(content.contains("main version"), "ours missing: {content}");
+    assert!(content.contains("topic version"), "theirs missing: {content}");
+    assert!(content.contains(">>>>>>>"), "no closing marker: {content}");
+}
+
+#[test]
+fn finishing_a_merge_makes_the_commit_and_clears_the_state() {
+    let dir = diverged();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    merge_ops::merge(&repo, "topic", None).expect("merge");
+    // Still unresolved: finishing now would commit the markers.
+    let premature = merge_ops::finish_merge(&repo, None);
+    assert!(premature.is_err(), "a half-resolved merge must not commit");
+    let why = format!("{:#}", premature.expect_err("must refuse"));
+    assert!(why.contains("notes/one.md"), "the refusal must name the file: {why}");
+
+    // Resolve by taking the topic wording, the way a user would.
+    fs::write(root.join("notes/one.md"), "line one\ntopic version\n").unwrap();
+    ops::stage_file(&repo, "notes/one.md").expect("stage the resolution");
+    assert!(merge_ops::unresolved_paths(&repo).unwrap().is_empty());
+
+    let sha = merge_ops::finish_merge(&repo, Some("took the topic side")).expect("finish");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), sha);
+    assert!(!merge_ops::merge_in_progress(&repo));
+    assert!(!root.join(".git/MERGE_HEAD").exists());
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert_eq!(git(root, &["log", "-1", "--format=%s"]).trim(), "took the topic side");
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), "line one\ntopic version\n");
+    // No conflict markers reached history.
+    assert!(!fs::read_to_string(root.join("notes/one.md")).unwrap().contains("<<<<<<<"));
+}
+
+#[test]
+fn a_finished_merge_is_readable_by_git_as_a_merge() {
+    let dir = diverged();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    merge_ops::merge(&repo, "topic", None).expect("merge");
+    fs::write(root.join("notes/one.md"), "line one\nmerged version\n").unwrap();
+    ops::stage_file(&repo, "notes/one.md").expect("stage");
+    merge_ops::finish_merge(&repo, None).expect("finish");
+
+    // HEAD plus two parents is what git means by a merge commit.
+    let line = git(root, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(line.split_whitespace().count(), 3, "HEAD plus two parents: {line}");
+    let subject = git(root, &["log", "-1", "--format=%s"]);
+    assert!(subject.contains("Merge commit"), "{subject}");
+}
+
+#[test]
+fn aborting_a_merge_puts_everything_back() {
+    let dir = diverged();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let before_file = fs::read_to_string(root.join("notes/one.md")).unwrap();
+
+    merge_ops::merge(&repo, "topic", None).expect("merge");
+    assert!(merge_ops::merge_in_progress(&repo));
+
+    let sha = merge_ops::abort_merge(&repo).expect("abort");
+    assert_eq!(sha, before.trim());
+    assert!(!merge_ops::merge_in_progress(&repo));
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), before.trim());
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), before_file);
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert!(git(root, &["log", "-1", "--format=%s"]).trim().ends_with("main edit"));
+}
+
+#[test]
+fn aborting_when_nothing_is_in_progress_is_refused() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    assert!(merge_ops::abort_merge(&repo).is_err());
+    assert!(merge_ops::finish_merge(&repo, None).is_err());
+}
+
+#[test]
+fn a_merge_that_would_clobber_local_edits_is_refused() {
+    let dir = clean_pair();
+    let root = dir.path();
+    // An uncommitted edit to the very file the merge would write.
+    fs::write(root.join("notes/topic.md"), "mine, uncommitted\n").unwrap();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    let refused = merge_ops::merge(&repo, "topic", None);
+    let why = format!("{:#}", refused.expect_err("must refuse"));
+    assert!(why.contains("notes/topic.md"), "the refusal must name the file: {why}");
+    // git refuses the same thing.
+    let out = Command::new("git")
+        .args(["merge", "topic"])
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(!out.status.success());
+
+    assert_eq!(
+        fs::read_to_string(root.join("notes/topic.md")).unwrap(),
+        "mine, uncommitted\n",
+        "the refused merge must not have written anything"
+    );
+    assert!(merge_ops::unresolved_paths(&repo).unwrap().is_empty());
+    assert!(!merge_ops::merge_in_progress(&repo));
+}
+
+#[test]
+fn a_merge_that_names_nothing_is_refused() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+    let before = git(root, &["rev-parse", "HEAD"]);
+
+    assert!(merge_ops::merge(&repo, "no-such-branch", None).is_err());
+    assert!(merge_ops::merge(&repo, "nonsense", None).is_err());
+    assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), before.trim());
+}
+
+#[test]
+fn staging_a_resolved_conflict_clears_its_stages() {
+    // Regression: staging used to add a stage-0 entry while leaving the
+    // stage 1/2/3 entries behind, so the path stayed unmerged forever and no
+    // merge commit could ever be finished.
+    let dir = diverged();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+    merge_ops::merge(&repo, "topic", None).expect("merge");
+    assert_eq!(merge_ops::unresolved_paths(&repo).unwrap().len(), 1);
+
+    fs::write(root.join("notes/one.md"), "line one\nresolved by hand\n").unwrap();
+    ops::stage_file(&repo, "notes/one.md").expect("stage");
+
+    assert!(merge_ops::unresolved_paths(&repo).unwrap().is_empty());
+    // git reads the index the same way we do.
+    assert_eq!(git(root, &["diff", "--name-only", "--diff-filter=U"]), "");
+    // The resolution is staged and the work tree matches it, which is what a
+    // staged change looks like until the merge commit exists.
+    assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "notes/one.md\n");
+    assert_eq!(git(root, &["diff", "--name-only"]), "");
 }
 

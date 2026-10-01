@@ -597,6 +597,7 @@ pub fn stage_file(repo: &Repository, path: &str) -> Result<()> {
         let blob = repo.odb.write(ObjectKind::Blob, target.to_string_lossy().as_bytes())?;
         let mut entry = make_index_entry(path, 0o120000, blob, &meta);
         entry.mode = 0o120000;
+        clear_path_stages(&mut index, path);
         index.add_or_replace(entry);
         return write_index_clean(repo, &mut index);
     }
@@ -604,6 +605,7 @@ pub fn stage_file(repo: &Repository, path: &str) -> Result<()> {
     let mode = staged_mode(&index, path, meta.permissions().mode(), core_filemode(repo));
     let data = fs::read(&full)?;
     let oid = repo.odb.write(ObjectKind::Blob, &data)?;
+    clear_path_stages(&mut index, path);
     index.add_or_replace(make_index_entry(path, mode, oid, &meta));
     write_index_clean(repo, &mut index)
 }
@@ -1244,6 +1246,16 @@ pub(crate) fn staged_mode(index: &Index, rel: &str, on_disk: u32, filemode: bool
     }
 }
 
+/// Drop every index entry for `path`, whatever stage it sits at.
+///
+/// Staging a resolved conflict has to clear the stage 1/2/3 entries as well.
+/// Leaving them behind keeps the path unmerged forever: `git status` still
+/// lists it under unmerged, and no merge commit can be made even though the
+/// user did the work and staged it.
+pub(crate) fn clear_path_stages(index: &mut Index, path: &str) {
+    index.entries.retain(|e| e.path != path.as_bytes());
+}
+
 pub(crate) fn add_path(repo: &Repository, index: &mut Index, full: &Path, filemode: bool) -> Result<()> {
     let work_tree = repo.work_tree.as_deref().context("bare repository")?;
     let rel = full
@@ -1255,6 +1267,7 @@ pub(crate) fn add_path(repo: &Repository, index: &mut Index, full: &Path, filemo
     let stat = fs::metadata(full)?;
     let mode = staged_mode(index, &rel, stat.permissions().mode(), filemode);
     let oid = repo.odb.write(ObjectKind::Blob, &data)?;
+    clear_path_stages(index, &rel);
     index.add_or_replace(make_index_entry(&rel, mode, oid, &stat));
     Ok(())
 }

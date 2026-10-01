@@ -230,3 +230,107 @@ public struct GritStash: Codable, Hashable, Sendable, Identifiable {
     /// `main -- WIP on main: ...`.
     public var title: String { message.isEmpty ? "stash@{\(index)}" : message }
 }
+
+/// How a merge ended.
+///
+/// The four cases are not variations of one thing: one is nothing to do, one
+/// is a ref move, one is a commit, and one is work the user still has to do.
+/// Collapsing them into a Bool would make the conflict case indistinguishable
+/// from success, which is the one case where the app must keep talking.
+public enum GritMergeOutcome: Hashable, Sendable {
+    /// The other side was already contained in HEAD.
+    case upToDate
+    /// HEAD moved to the other commit; no merge commit was created.
+    case fastForward(head: String)
+    /// A merge commit was created and the branch points at it.
+    case merged(head: String)
+    /// The merge is incomplete: HEAD has not moved and these paths need
+    /// resolving before it can be finished.
+    case conflicted(head: String, files: [String])
+
+    /// Whether the user still has to resolve something.
+    public var needsResolution: Bool {
+        if case .conflicted = self { return true }
+        return false
+    }
+
+    /// The commit HEAD now points at, when there is one.
+    public var head: String? {
+        switch self {
+        case .upToDate: return nil
+        case let .fastForward(head): return head
+        case let .merged(head): return head
+        case let .conflicted(head, _): return head
+        }
+    }
+
+    /// The paths still carrying conflict markers.
+    public var conflictedFiles: [String] {
+        if case let .conflicted(_, files) = self { return files }
+        return []
+    }
+
+    /// A sentence for the user, rather than a bare state name.
+    public var summary: String {
+        switch self {
+        case .upToDate:
+            return "Already up to date"
+        case .fastForward:
+            return "Fast-forwarded"
+        case .merged:
+            return "Merged"
+        case let .conflicted(_, files):
+            let count = files.count
+            return count == 1
+                ? "1 file has conflicts"
+                : "\(count) files have conflicts"
+        }
+    }
+}
+
+/// The wire shape of `MergeOutcome` in `src/types.rs`.
+struct GritMergePayload: Decodable {
+    let kind: String
+    let head: String?
+    let files: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case head
+        case files
+    }
+
+    var outcome: GritMergeOutcome {
+        switch kind {
+        case "FastForward":
+            return .fastForward(head: head ?? "")
+        case "Merged":
+            return .merged(head: head ?? "")
+        case "Conflicted":
+            return .conflicted(head: head ?? "", files: files ?? [])
+        default:
+            return .upToDate
+        }
+    }
+}
+
+/// Whether a merge is waiting to be finished, and what it is waiting on.
+public struct GritMergeState: Codable, Hashable, Sendable {
+    /// A merge was started and has not been finished or aborted.
+    public let inProgress: Bool
+    /// Paths with unmerged index entries.
+    public let unresolved: [String]
+
+    public init(inProgress: Bool, unresolved: [String]) {
+        self.inProgress = inProgress
+        self.unresolved = unresolved
+    }
+
+    /// Nothing left to resolve, so the merge can be committed.
+    public var isReadyToFinish: Bool { inProgress && unresolved.isEmpty }
+
+    enum CodingKeys: String, CodingKey {
+        case inProgress = "in_progress"
+        case unresolved
+    }
+}

@@ -519,9 +519,68 @@ public final class GritRepository {
         guard result == 0 else { throw GritError.failure() }
     }
 
-    // MARK: - C plumbing
+
+    // MARK: - Merge
+
+    /// Merge a branch (or commit) into the current branch.
+    ///
+    /// Returns what happened rather than only whether it worked: an up-to-date
+    /// merge is a no-op, and a conflicted merge is a state the caller has to
+    /// keep showing until it is resolved. Collapsing either into a thrown error
+    /// would make them indistinguishable from failure.
+    ///
+    /// Throws without touching the work tree when the merge would overwrite
+    /// uncommitted edits; the refusal names the files.
+    public func merge(_ spec: String, message: String? = nil) throws -> GritMergeOutcome {
+        var raw: UnsafeMutablePointer<CChar>?
+        let text = message ?? ""
+        text.withCString { textPtr in
+            spec.withCString { specPtr in
+                raw = grit_repo_merge_json(handle, specPtr, message == nil ? nil : textPtr)
+            }
+        }
+        let json = try takeString { raw }
+        guard let data = json.data(using: .utf8) else {
+            throw GritError.failure()
+        }
+        do {
+            return try JSONDecoder().decode(GritMergePayload.self, from: data).outcome
+        } catch {
+            // A payload we cannot read is not "no merge happened".
+            throw GritError.failure()
+        }
+    }
+
+    /// Whether a merge is waiting to be finished, and what it is waiting on.
+    public func mergeState() throws -> GritMergeState {
+        try decode(GritMergeState.self) { grit_repo_merge_conflicts_json(handle) }
+    }
+
+    /// Commit the merge once every conflict is resolved.
+    ///
+    /// Throws, naming the files, while anything is still unmerged: committing a
+    /// half-resolved merge would put conflict markers into history.
+    @discardableResult
+    public func finishMerge(message: String? = nil) throws -> String {
+        var raw: UnsafeMutablePointer<CChar>?
+        let text = message ?? ""
+        text.withCString { textPtr in
+            raw = grit_repo_merge_finish(handle, message == nil ? nil : textPtr)
+        }
+        return try takeString { raw }
+    }
+
+    /// Throw the merge away and go back to where the branch was.
+    ///
+    /// This discards the conflicted work tree content, so the UI confirms it
+    /// first. Returns the commit the branch was on before the merge.
+    @discardableResult
+    public func abortMerge() throws -> String {
+        try takeString { grit_repo_merge_abort(handle) }
+    }
 
     // MARK: - C plumbing
+
 
     /// The raw handle, for the network entry points in `GritNetwork`.
     ///
