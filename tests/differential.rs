@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use neurascribe_grit_ffi::{ops, refs_ops};
+use neurascribe_grit_ffi::{ops, refs_ops, stash_ops};
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -699,5 +699,352 @@ fn deleting_the_current_branch_is_refused() {
     assert!(err.contains("current branch"), "HEAD branch delete was not refused: {err}");
     assert_eq!(ops::current_branch(&repo).unwrap(), "main");
     assert_eq!(git(root, &["rev-parse", "HEAD"]).trim(), ops::head_sha(&repo).unwrap());
+}
+
+
+// ---------------------------------------------------------------- stash
+
+/// Stash and our own reading of it, on a repo real git built.
+fn stash_fixture() -> TempDir {
+    let dir = fixture();
+    let root = dir.path();
+    fs::write(root.join("notes/one.md"), "edited one\n").unwrap();
+    fs::write(root.join("notes/sub/two.md"), "alpha\nbeta\ngamma\n").unwrap();
+    dir
+}
+
+#[test]
+fn stash_push_cleans_the_tree_and_git_reads_the_stash() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    let sha = stash_ops::push(&repo, None, false).expect("stash");
+    assert_eq!(sha.len(), 40, "a stash is a commit, so it has an object id");
+
+    // The work is put away: the tree is back to HEAD and the edits are gone.
+    assert_eq!(git(root, &["status", "--porcelain"]), "", "tree should be clean");
+    assert_eq!(
+        fs::read_to_string(root.join("notes/one.md")).unwrap(),
+        "line one\nline two changed\n",
+        "the file went back to its committed content"
+    );
+
+    // And real git agrees this is a stash, with the same subject shape.
+    let list = git(root, &["stash", "list"]);
+    assert_eq!(list.lines().count(), 1, "one stash: {list}");
+    assert!(
+        list.contains("WIP on main:"),
+        "generated subject should follow the git shape: {list}"
+    );
+    // The stash names its base commit, abbreviated the way git abbreviates.
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let abbrev: String = head.trim().chars().take(7).collect();
+    assert!(
+        list.contains(&abbrev),
+        "WIP line should name the commit it was taken from: {list}"
+    );
+    assert!(
+        list.contains(" second"),
+        "and the subject it was taken from: {list}"
+    );
+}
+
+#[test]
+fn stash_commit_has_git_parent_shape() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    let sha = stash_ops::push(&repo, None, false).expect("stash");
+    let shown = git(root, &["cat-file", "-p", &sha]);
+    let parents: Vec<&str> = shown
+        .lines()
+        .filter(|l| l.starts_with("parent "))
+        .map(|l| l.split_whitespace().nth(1).unwrap_or_default())
+        .collect();
+    assert_eq!(parents.len(), 2, "HEAD and the index state: {shown}");
+    assert_eq!(parents[0], git(root, &["rev-parse", "HEAD"]).trim());
+}
+
+#[test]
+fn stash_message_replaces_the_generated_subject() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, Some("before the rewrite"), false).expect("stash");
+    let list = git(root, &["stash", "list"]);
+    assert!(list.contains("before the rewrite"), "message was dropped: {list}");
+}
+
+#[test]
+fn our_stashes_read_back_through_our_own_api() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("first");
+    fs::write(root.join("notes/one.md"), "edited again\n").unwrap();
+    stash_ops::push(&repo, None, false).expect("second");
+
+    let stashes = stash_ops::list_stashes(&repo).expect("list");
+    assert_eq!(stashes.len(), 2);
+    // Newest first, which is what stash@{0} means.
+    assert_eq!(stashes[0].index, 0);
+    assert_ne!(stashes[0].sha, stashes[1].sha);
+    assert_eq!(stashes[0].sha, git(root, &["rev-parse", "refs/stash"]).trim());
+    assert_eq!(stash_ops::preview_paths(&repo, "stash@{0}").unwrap().len(), 1);
+}
+
+#[test]
+fn we_read_a_stack_git_wrote() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    git(root, &["stash", "push", "-q"]);
+    git(root, &["stash", "pop", "-q"]);
+    fs::write(root.join("notes/one.md"), "third state\n").unwrap();
+    git(root, &["stash", "push", "-q", "-m", "second one"]);
+
+    let stashes = stash_ops::list_stashes(&repo).expect("list");
+    assert_eq!(stashes.len(), 1, "the first was popped away");
+    assert_eq!(stashes[0].sha, git(root, &["rev-parse", "refs/stash"]).trim());
+    assert!(stashes[0].message.contains("second one"));
+}
+
+#[test]
+fn applying_puts_the_work_back() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("stash");
+    stash_ops::apply(&repo, "stash@{0}").expect("apply");
+
+    assert_eq!(
+        fs::read_to_string(root.join("notes/one.md")).unwrap(),
+        "edited one\n",
+        "the stashed content is back"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("notes/sub/two.md")).unwrap(),
+        "alpha\nbeta\ngamma\n"
+    );
+    // The stash is still there; apply is not pop.
+    assert_eq!(stash_ops::list_stashes(&repo).unwrap().len(), 1);
+    // Restored changes are unstaged, which is what a plain apply leaves.
+    assert_eq!(git(root, &["diff", "--name-only"]), "notes/one.md\nnotes/sub/two.md\n");
+}
+
+#[test]
+fn applying_a_stash_git_wrote_restores_the_same_files() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    git(root, &["stash", "push", "-q"]);
+    stash_ops::apply(&repo, "stash@{0}").expect("apply a git stash");
+    assert_eq!(
+        fs::read_to_string(root.join("notes/one.md")).unwrap(),
+        "edited one\n"
+    );
+}
+
+#[test]
+fn pop_restores_and_empties_the_stack() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("stash");
+    stash_ops::pop(&repo, "stash@{0}").expect("pop");
+
+    assert!(stash_ops::list_stashes(&repo).unwrap().is_empty());
+    assert_eq!(git(root, &["stash", "list"]), "");
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), "edited one\n");
+    // The index was not disturbed either.
+    assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "");
+}
+
+#[test]
+fn dropping_empties_the_stack_without_restoring_anything() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("stash");
+    stash_ops::drop(&repo, "stash@{0}").expect("drop");
+
+    assert!(stash_ops::list_stashes(&repo).unwrap().is_empty());
+    // Still at HEAD: dropping loses the work on purpose.
+    assert_eq!(
+        fs::read_to_string(root.join("notes/one.md")).unwrap(),
+        "line one\nline two changed\n"
+    );
+    assert!(git(root, &["stash", "list"]).is_empty());
+}
+
+#[test]
+fn a_dropped_stack_leaves_no_ref_behind() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("stash");
+    stash_ops::drop(&repo, "stash@{0}").expect("drop");
+    // git would read a dangling ref here; the stack must be genuinely empty.
+    assert!(!root.join(".git/refs/stash").exists());
+    assert!(stash_ops::list_stashes(&repo).unwrap().is_empty());
+}
+
+#[test]
+fn untracked_files_round_trip_when_asked_for() {
+    let dir = fixture();
+    let root = dir.path();
+    fs::write(root.join("scratch.md"), "not tracked yet\n").unwrap();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    let sha = stash_ops::push(&repo, None, true).expect("stash with untracked");
+    assert!(!root.join("scratch.md").exists(), "untracked file should be put away");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+
+    // Three parents: HEAD, the index, and the bag of untracked files.
+    let shown = git(root, &["cat-file", "-p", &sha]);
+    assert_eq!(shown.lines().filter(|l| l.starts_with("parent ")).count(), 3);
+
+    stash_ops::pop(&repo, "stash@{0}").expect("pop");
+    assert_eq!(
+        fs::read_to_string(root.join("scratch.md")).unwrap(),
+        "not tracked yet\n"
+    );
+    // Untracked again, not staged: that is what git restores.
+    assert_eq!(git(root, &["status", "--porcelain"]), "?? scratch.md\n");
+}
+
+#[test]
+fn untracked_files_are_left_alone_without_the_flag() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    fs::write(root.join("scratch.md"), "not tracked yet\n").unwrap();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("stash without untracked");
+    assert!(
+        root.join("scratch.md").exists(),
+        "git leaves untracked files alone when -u is absent"
+    );
+}
+
+#[test]
+fn applying_refuses_to_clobber_local_changes() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("stash");
+    // A different edit to the same file since the stash.
+    fs::write(root.join("notes/one.md"), "something else entirely\n").unwrap();
+
+    let refused = stash_ops::apply(&repo, "stash@{0}");
+    assert!(refused.is_err(), "applying must refuse, not clobber");
+    // git refuses the same thing. Its complaint goes to stderr and its exit
+    // code is non-zero, so it cannot go through the asserting helper.
+    let out = Command::new("git")
+        .args(["stash", "apply"])
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(!out.status.success(), "git should refuse this too");
+    let complaint = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        complaint.contains("notes/one.md"),
+        "git names the file it would clobber: {complaint}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("notes/one.md")).unwrap(),
+        "something else entirely\n",
+        "the refused apply must not have written anything"
+    );
+}
+
+#[test]
+fn a_clean_tree_has_nothing_to_stash() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    let refused = stash_ops::push(&repo, None, false);
+    assert!(refused.is_err(), "nothing local to save");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_selector_that_names_nothing_is_refused() {
+    let dir = fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    assert!(stash_ops::apply(&repo, "stash@{0}").is_err(), "empty stack");
+    assert!(stash_ops::apply(&repo, "stash@{7}").is_err(), "out of range");
+    assert!(stash_ops::apply(&repo, "nonsense").is_err(), "not a selector");
+    assert!(stash_ops::apply(&repo, &"0".repeat(40)).is_err(), "no such commit");
+}
+
+#[test]
+fn stashing_keeps_the_index_and_work_tree_apart() {
+    let dir = fixture();
+    let root = dir.path();
+    // Staged one thing, edited another on top of it: the two must not blur.
+    fs::write(root.join("notes/one.md"), "staged content\n").unwrap();
+    git(root, &["add", "notes/one.md"]);
+    fs::write(root.join("notes/sub/two.md"), "unstaged content\n").unwrap();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    stash_ops::push(&repo, None, false).expect("stash");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+
+    // The stash tree is the work tree: both edits are in it.
+    let sha = stash_ops::list_stashes(&repo).unwrap()[0].sha.clone();
+    let tree = git(root, &["ls-tree", "-r", "--name-only", &sha]);
+    assert!(tree.contains("notes/one.md"));
+    assert!(tree.contains("notes/sub/two.md"));
+}
+
+
+
+#[test]
+fn dropping_the_middle_of_a_stack_leaves_the_right_two() {
+    let dir = stash_fixture();
+    let root = dir.path();
+    let repo = ops::open(root).expect("grit opens the repo");
+
+    for body in ["one", "two", "three"] {
+        fs::write(root.join("notes/one.md"), format!("{body}\n")).unwrap();
+        stash_ops::push(&repo, Some(body), false).expect("stash");
+    }
+    let before = stash_ops::list_stashes(&repo).unwrap();
+    assert_eq!(before.len(), 3);
+
+    // The middle one: newest is index 0, so this is stash@{1}.
+    stash_ops::drop(&repo, "stash@{1}").expect("drop the middle");
+
+    let after = stash_ops::list_stashes(&repo).unwrap();
+    assert_eq!(after.len(), 2);
+    assert_eq!(
+        after.iter().map(|e| e.sha.clone()).collect::<Vec<_>>(),
+        vec![before[0].sha.clone(), before[2].sha.clone()],
+        "the newest and the oldest should survive"
+    );
+    // And git agrees which is on top now.
+    assert_eq!(
+        git(root, &["rev-parse", "refs/stash"]).trim(),
+        before[0].sha,
+        "refs/stash should point at the newest survivor"
+    );
+    // The surviving stack still applies: the deletion did not corrupt it.
+    stash_ops::pop(&repo, "stash@{1}").expect("pop the older survivor");
+    assert_eq!(fs::read_to_string(root.join("notes/one.md")).unwrap(), "one\n");
 }
 

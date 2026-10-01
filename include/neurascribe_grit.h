@@ -299,11 +299,25 @@ int32_t grit_repo_remove_submodule(GritRepoHandle *repo, const char *path);
 /* Checks the submodule's work tree out at the superproject's recorded commit. */
 char *grit_repo_checkout_submodule_to(GritRepoHandle *repo, const char *path, const char *sha);
 
-#ifdef __cplusplus
-}
-#endif
 
-#endif /* NEURASCRIBE_GRIT_H */
+/* --- Stash --- */
+
+/* The stash stack, newest first: [{"index":0,"sha":"...","message":"WIP on main: 1a2b3c4 subject","paths":["a.md"]}].
+ * Free with grit_string_free. */
+char *grit_repo_list_stashes_json(GritRepoHandle *repo);
+
+/* Put the work in progress aside (git stash push). `message` may be NULL, in which
+ * case the subject follows the git shape. `include_untracked` non-zero also stashes
+ * untracked files (git -u). Returns the new commit id, or NULL with the reason in
+ * grit_last_error. */
+char *grit_repo_stash_push(GritRepoHandle *repo, const char *message, int include_untracked);
+
+/* Restore a stash. `selector` is "stash@{N}" or a commit id. `pop` non-zero also drops it. */
+int32_t grit_repo_stash_apply(GritRepoHandle *repo, const char *selector, int pop);
+
+/* Throw a stash away without restoring it. */
+int32_t grit_repo_stash_drop(GritRepoHandle *repo, const char *selector);
+
 
 /// Paths the index tracks below a directory, as a JSON array of strings.
 /// Returns NULL on failure; free with grit_string_free.
@@ -312,3 +326,8 @@ char *grit_repo_indexed_paths_under_json(GritRepoHandle *repo, const char *direc
 /// Stop tracking everything under a directory, leaving the files on disk
 /// (git rm -r --cached). Returns entries removed, or -1 on failure.
 int32_t grit_repo_untrack_directory(GritRepoHandle *repo, const char *directory);
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NEURASCRIBE_GRIT_H */

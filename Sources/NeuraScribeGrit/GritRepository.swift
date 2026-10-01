@@ -481,6 +481,46 @@ public final class GritRepository {
         guard result == 0 else { throw GritError.failure() }
     }
 
+    /// The stash stack, newest first.
+    public func stashes() throws -> [GritStash] {
+        try decode([GritStash].self) { grit_repo_list_stashes_json(handle) }
+    }
+
+    /// Put the work in progress aside (git stash push).
+    ///
+    /// `includeUntracked` is git's `-u`. `message` replaces the generated
+    /// subject; passing nil gets the `WIP on <branch>: <sha> <subject>` form.
+    ///
+    /// Restores the work tree to HEAD, so the changes have to be wanted.
+    public func stashPush(message: String? = nil, includeUntracked: Bool = false) throws -> String {
+        var raw: UnsafeMutablePointer<CChar>?
+        let text = message ?? ""
+        text.withCString { textPtr in
+            raw = grit_repo_stash_push(handle, message == nil ? nil : textPtr, includeUntracked ? 1 : 0)
+        }
+        return try takeString { raw }
+    }
+
+    /// Restore a stash. `selector` is `stash@{N}` or a commit id.
+    ///
+    /// Restored changes land unstaged, as `git stash apply` leaves them.
+    /// Throws without writing anything when the stash would overwrite local
+    /// edits — the refusal names the files.
+    public func stashApply(_ selector: String, pop: Bool = false) throws {
+        let result = selector.withCString {
+            grit_repo_stash_apply(handle, $0, pop ? 1 : 0)
+        }
+        guard result == 0 else { throw GritError.failure() }
+    }
+
+    /// Throw a stash away without restoring it.
+    public func stashDrop(_ selector: String) throws {
+        let result = selector.withCString { grit_repo_stash_drop(handle, $0) }
+        guard result == 0 else { throw GritError.failure() }
+    }
+
+    // MARK: - C plumbing
+
     // MARK: - C plumbing
 
     /// The raw handle, for the network entry points in `GritNetwork`.

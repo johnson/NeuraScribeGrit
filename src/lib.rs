@@ -14,6 +14,7 @@ pub mod net;
 pub mod ops;
 pub mod progress;
 pub mod refs_ops;
+pub mod stash_ops;
 pub mod submodules;
 pub mod types;
 
@@ -1041,3 +1042,95 @@ pub unsafe extern "C" fn grit_repo_untrack_directory(
         }
     }
 }
+// --- Stash ---
+
+/// The stash stack, newest first, as JSON:
+/// `[{"index":0,"sha":"...","message":"WIP on main: 1a2b3c4 subject","paths":["a.md"]}]`.
+#[no_mangle]
+pub extern "C" fn grit_repo_list_stashes_json(repo: *mut Repository) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    guard_json(|| {
+        let mut entries = Vec::new();
+        for entry in stash_ops::list_stashes(repo)? {
+            // An unreadable preview must not hide the stash itself: the paths
+            // are a nicety, the entry is the fact.
+            let paths = stash_ops::preview_paths(repo, &entry.sha).unwrap_or_default();
+            entries.push(serde_json::json!({
+                "index": entry.index,
+                "sha": entry.sha,
+                "message": entry.message,
+                "paths": paths,
+            }));
+        }
+        Ok(serde_json::Value::Array(entries))
+    })
+}
+
+/// Put the work in progress aside (git stash push). Returns the new commit id.
+/// `message` may be null, in which case the subject follows the git shape.
+#[no_mangle]
+pub extern "C" fn grit_repo_stash_push(
+    repo: *mut Repository,
+    message: *const c_char,
+    include_untracked: i32,
+) -> *mut c_char {
+    if repo.is_null() {
+        set_error("null repo");
+        return std::ptr::null_mut();
+    }
+    let repo = unsafe { &*repo };
+    // A null message means "none given", which is what an optional Swift
+    // String bridges to; an empty string is a real (empty) message.
+    let message: Option<String> = (unsafe { take_str(message) });
+    guard_string(move || {
+        stash_ops::push(repo, message.as_deref(), include_untracked != 0)
+            .map_err(anyhow::Error::from)
+    })
+}
+
+/// Restore a stash (apply or pop). `selector` is `stash@{N}` or a commit id.
+#[no_mangle]
+pub extern "C" fn grit_repo_stash_apply(
+    repo: *mut Repository,
+    selector: *const c_char,
+    pop: i32,
+) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(selector) = (unsafe { take_str(selector) }) else {
+        set_error("null selector");
+        return -1;
+    };
+    guard_unit(move || {
+        let outcome = if pop != 0 {
+            stash_ops::pop(repo, &selector)?
+        } else {
+            stash_ops::apply(repo, &selector)?
+        };
+        let _ = outcome;
+        Ok(())
+    })
+}
+
+/// Throw a stash away without restoring it.
+#[no_mangle]
+pub extern "C" fn grit_repo_stash_drop(repo: *mut Repository, selector: *const c_char) -> i32 {
+    if repo.is_null() {
+        set_error("null repo");
+        return -1;
+    }
+    let repo = unsafe { &*repo };
+    let Some(selector) = (unsafe { take_str(selector) }) else {
+        set_error("null selector");
+        return -1;
+    };
+    guard_unit(move || stash_ops::drop(repo, &selector))
+}
+

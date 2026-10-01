@@ -207,3 +207,26 @@ public struct GritBranchInfo: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+
+/// One entry of the stash stack.
+public struct GritStash: Codable, Hashable, Sendable, Identifiable {
+    /// Position in the stack, 0 being the most recent -- what `stash@{N}` means.
+    public let index: Int
+    public let sha: String
+    /// The subject git would print for it, e.g. `WIP on main: 1a2b3c4 draft`.
+    public let message: String
+    /// Paths the stash would restore, tracked and untracked.
+    public let paths: [String]
+
+    public var id: Int { index }
+
+    /// The selector that addresses this entry.
+    public var selector: String { "stash@{\(index)}" }
+
+    /// What to show in a menu.
+    ///
+    /// The subject git prints is already prefixed (`WIP on main:` /
+    /// `On main:`), so repeating the branch in front of it would read as
+    /// `main -- WIP on main: ...`.
+    public var title: String { message.isEmpty ? "stash@{\(index)}" : message }
+}

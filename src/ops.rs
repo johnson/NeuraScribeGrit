@@ -432,7 +432,7 @@ pub fn reset_hard_to(repo: &Repository, sha: &str) -> Result<String> {
         &target,
         &previous,
         &oid,
-        APP_REFLOG_IDENTITY,
+        &app_reflog_identity(),
         &format!("reset: moving to {sha}"),
     );
     Ok(oid.to_string())
@@ -517,7 +517,7 @@ pub fn reset_mixed_to(repo: &Repository, sha: &str) -> Result<String> {
         &target,
         &previous,
         &oid,
-        APP_REFLOG_IDENTITY,
+        &app_reflog_identity(),
         &format!("reset (mixed): moving to {sha}"),
     );
     Ok(format!("{oid} ({before} -> {} entries)", index.entries.len()))
@@ -745,7 +745,7 @@ pub fn staged_entries(repo: &Repository) -> Result<Vec<FileStatus>> {
 /// staging a deletion under `notes/sub/` made `git status` report `D run.sh`
 /// instead of `D notes/sub/two.md`. Dropping the extension is always safe — git
 /// falls back to re-deriving the trees from the entries on the next read.
-fn write_index_clean(repo: &Repository, index: &mut Index) -> Result<()> {
+pub(crate) fn write_index_clean(repo: &Repository, index: &mut Index) -> Result<()> {
     index.cache_tree = None;
     index.cache_tree_root = None;
     repo.write_index(index)?;
@@ -764,7 +764,7 @@ fn status_name(status: &DiffStatus) -> &'static str {
     }
 }
 
-fn index_paths(index: &Index) -> BTreeSet<String> {
+pub(crate) fn index_paths(index: &Index) -> BTreeSet<String> {
     index.entries.iter().map(|e| String::from_utf8_lossy(&e.path).to_string()).collect()
 }
 
@@ -1078,7 +1078,7 @@ fn subject_of(message: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-fn commit_tree(repo: &Repository, sha: &str) -> Result<ObjectId> {
+pub(crate) fn commit_tree(repo: &Repository, sha: &str) -> Result<ObjectId> {
     let oid: ObjectId = sha.parse().with_context(|| format!("bad commit {sha}"))?;
     let object = repo.odb.read(&oid)?;
     if object.kind != ObjectKind::Commit {
@@ -1123,12 +1123,12 @@ pub fn staged_tree_matches_head(repo: &Repository) -> Result<bool> {
     Ok(staged == head_entries)
 }
 
-fn parent_of(repo: &Repository, oid: &ObjectId) -> Result<Option<ObjectId>> {
+pub(crate) fn parent_of(repo: &Repository, oid: &ObjectId) -> Result<Option<ObjectId>> {
     let object = repo.odb.read(oid)?;
     Ok(parse_commit(&object.data)?.parents.first().copied())
 }
 
-fn blob_at_head(repo: &Repository, path: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn blob_at_head(repo: &Repository, path: &str) -> Result<Option<Vec<u8>>> {
     let Some(sha) = head_sha(repo) else { return Ok(None) };
     let tree = commit_tree(repo, &sha)?;
     let entries = flatten_tree(&repo.odb, tree)?;
@@ -1140,7 +1140,7 @@ fn blob_at_head(repo: &Repository, path: &str) -> Result<Option<Vec<u8>>> {
 
 /// Flatten a tree into (relative path, mode, oid), depth first, sorted by path.
 /// Mode git gives a submodule pointer in a tree entry.
-const MODE_GITLINK: u32 = 0o160000;
+pub(crate) const MODE_GITLINK: u32 = 0o160000;
 
 /// Index entry for a submodule pointer.
 ///
@@ -1169,7 +1169,7 @@ fn make_gitlink_entry(path: &str, oid: &ObjectId, work_tree: &std::path::Path) -
     }
 }
 
-fn flatten_tree(odb: &grit_lib::odb::Odb, tree: ObjectId) -> Result<Vec<(String, u32, ObjectId)>> {
+pub(crate) fn flatten_tree(odb: &grit_lib::odb::Odb, tree: ObjectId) -> Result<Vec<(String, u32, ObjectId)>> {
     let mut out = Vec::new();
     let mut stack = vec![(String::new(), tree)];
     while let Some((prefix, oid)) = stack.pop() {
@@ -1191,7 +1191,7 @@ fn flatten_tree(odb: &grit_lib::odb::Odb, tree: ObjectId) -> Result<Vec<(String,
     Ok(out)
 }
 
-fn make_index_entry(path: &str, mode: u32, oid: ObjectId, stat: &fs::Metadata) -> IndexEntry {
+pub(crate) fn make_index_entry(path: &str, mode: u32, oid: ObjectId, stat: &fs::Metadata) -> IndexEntry {
     IndexEntry {
         ctime_sec: stat.ctime() as u32,
         ctime_nsec: stat.ctime_nsec() as u32,
@@ -1218,7 +1218,7 @@ fn make_index_entry(path: &str, mode: u32, oid: ObjectId, stat: &fs::Metadata) -
 /// when this is false, because on such a filesystem the bit says nothing about
 /// the file. Reading it anyway turned every tracked file on the iPad into a mode
 /// change: 9762 of them in one commit, content untouched.
-fn core_filemode(repo: &Repository) -> bool {
+pub(crate) fn core_filemode(repo: &Repository) -> bool {
     ConfigSet::load(Some(&repo.git_dir), true)
         .ok()
         .and_then(|config| config.get_bool("core.filemode").and_then(|result| result.ok()))
@@ -1227,7 +1227,7 @@ fn core_filemode(repo: &Repository) -> bool {
 
 /// The mode to record for `rel`: what is on disk when the execute bit is
 /// trustworthy, otherwise whatever the index already said about it.
-fn staged_mode(index: &Index, rel: &str, on_disk: u32, filemode: bool) -> u32 {
+pub(crate) fn staged_mode(index: &Index, rel: &str, on_disk: u32, filemode: bool) -> u32 {
     if filemode {
         if on_disk & 0o111 != 0 {
             MODE_EXECUTABLE
@@ -1244,7 +1244,7 @@ fn staged_mode(index: &Index, rel: &str, on_disk: u32, filemode: bool) -> u32 {
     }
 }
 
-fn add_path(repo: &Repository, index: &mut Index, full: &Path, filemode: bool) -> Result<()> {
+pub(crate) fn add_path(repo: &Repository, index: &mut Index, full: &Path, filemode: bool) -> Result<()> {
     let work_tree = repo.work_tree.as_deref().context("bare repository")?;
     let rel = full
         .strip_prefix(work_tree.canonicalize()?)
@@ -1259,7 +1259,7 @@ fn add_path(repo: &Repository, index: &mut Index, full: &Path, filemode: bool) -
     Ok(())
 }
 
-fn set_executable(path: &Path) -> Result<()> {
+pub(crate) fn set_executable(path: &Path) -> Result<()> {
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms)?;
@@ -1267,7 +1267,7 @@ fn set_executable(path: &Path) -> Result<()> {
 }
 
 /// `Name <email> <unix-seconds> +0000`
-fn format_ident(name: &str, email: &str) -> String {
+pub(crate) fn format_ident(name: &str, email: &str) -> String {
     let secs =
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("{name} <{email}> {secs} +0000")
@@ -1276,7 +1276,7 @@ fn format_ident(name: &str, email: &str) -> String {
 /// Reflog message for a commit, matching what git records: the command, then
 /// the subject line only. A multi-line body would have to be escaped to stay on
 /// one reflog line, and no one reads a reflog for the body.
-fn commit_reflog_message(message: &str) -> String {
+pub(crate) fn commit_reflog_message(message: &str) -> String {
     let subject = message.trim().lines().next().unwrap_or("").trim();
     if subject.is_empty() {
         "commit".to_string()
@@ -1287,7 +1287,14 @@ fn commit_reflog_message(message: &str) -> String {
 
 /// Identity recorded for ref moves the app makes outside a commit, where
 /// the caller supplies no author.
-const APP_REFLOG_IDENTITY: &str = "NeuraScribe <app@neurascribe.local>";
+///
+/// It has to carry a timestamp and a zone: git's reflog parser rejects a
+/// line without them, so a bare "Name <email>" leaves `git reflog` unable to read
+/// anything -- and `git stash list` reads the stash reflog, not the ref.
+/// UTC is what the commit identities above already use.
+pub(crate) fn app_reflog_identity() -> String {
+    format_ident("NeuraScribe", "app@neurascribe.local")
+}
 
 /// Append a reflog entry to the ref that moved *and* to HEAD's log, the way
 /// git does: moving a branch that HEAD points at is recorded twice, once
@@ -1297,7 +1304,7 @@ const APP_REFLOG_IDENTITY: &str = "NeuraScribe <app@neurascribe.local>";
 ///
 /// Advisory, like git's own: a reflog that cannot be written must not fail the
 /// commit that already succeeded.
-fn append_reflog(
+pub(crate) fn append_reflog(
     repo: &Repository,
     refname: &str,
     old_oid: &ObjectId,
@@ -1328,7 +1335,7 @@ fn append_reflog(
 /// Current value of a ref, or the zero oid when it does not exist yet.
 ///
 /// Read *before* the ref is written; afterwards the old value is gone.
-fn ref_value(repo: &Repository, refname: &str) -> ObjectId {
+pub(crate) fn ref_value(repo: &Repository, refname: &str) -> ObjectId {
     grit_lib::refs::resolve_ref(&repo.git_dir, refname).unwrap_or_else(|_| ObjectId::zero())
 }
 
