@@ -57,7 +57,14 @@ let package = Package(
         .testTarget(
             name: "NeuraScribeGritTests",
             dependencies: ["NeuraScribeGrit"],
-            path: "Tests/NeuraScribeGritTests"
+            // Lowercase on purpose. This directory also holds the Rust
+            // integration tests (differential.rs, index_ops.rs and the rest),
+            // and Cargo only auto-discovers a lowercase `tests/`. The macOS
+            // volume is case-insensitive so both tools find the folder either
+            // way, but SwiftPM validates the declared casing against the
+            // disk and fails the whole package when they disagree -- so the
+            // manifest follows the disk rather than the Swift convention.
+            path: "tests/NeuraScribeGritTests"
         )
     ]
 )
