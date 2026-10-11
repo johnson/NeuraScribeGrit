@@ -1,10 +1,12 @@
-//! Network operations: clone, fetch and push over smart HTTP.
+//! Network operations: clone, fetch and push over smart HTTP, the native
+//! git daemon protocol (fetch only), and local directories.
 //!
-//! All three run on grit's own protocol implementations -- `http_fetch` and
-//! `push_http` do the full smart-HTTP dance, and clone is init + fetch +
-//! checkout. The only thing this module supplies is grit's `HttpClient`, the
-//! credential, and turning the results into the shapes the Swift side already
-//! knows from the gix backend.
+//! The HTTP operations run on grit's own protocol implementations -- `http_fetch`
+//! and `push_http` do the full smart-HTTP dance, and clone is init + fetch +
+//! checkout. git:// fetches go through grit's `GitDaemonTransport` (raw TCP,
+//! no HTTP bridge involved). The only things this module supplies are grit's
+//! `HttpClient`, the credential, and turning the results into the shapes the
+//! Swift side already knows from the gix backend.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use grit_lib::transfer::{FetchOptions, FetchOutcome, PushOptions, PushRefSpec, TagMode};
+use grit_lib::transport::Transport;
 
 use crate::http;
 use crate::ops;
@@ -186,6 +189,34 @@ pub fn fetch(
         .with_context(|| format!("fetch from {} failed", remote_git_dir.display()))?;
         // No HTTP boundary, so no byte total to report; the ref updates
         // below are still real.
+        report_fetch(&reporter, &outcome, 0);
+        return Ok(FetchResult::from_outcome(&outcome));
+    }
+
+    // A git:// URL speaks the native daemon protocol over a raw TCP socket.
+    // URLSession has no handler for that scheme, but the daemon transport is
+    // self-contained (no HTTP at all), so it works on iOS exactly as on the
+    // desktop -- and it is the natural choice for LAN sync with a machine on
+    // the same network (no TLS, no credentials, one port).
+    if url.trim_start().starts_with("git://") {
+        let transport = grit_lib::transport::GitDaemonTransport::new();
+        let mut conn = transport
+            .connect(
+                url.trim(),
+                grit_lib::transport::Service::UploadPack,
+                &grit_lib::transport::ConnectOptions::default(),
+            )
+            .with_context(|| format!("connect to {url} failed"))?;
+        let mut bridge = ProgressBridge::new(progress);
+        let outcome = grit_lib::fetch::fetch_remote(
+            git_dir,
+            conn.as_mut(),
+            &fetch_options(refspecs.to_vec()),
+            &mut bridge,
+        )
+        .with_context(|| format!("fetch from {url} failed"))?;
+        // Raw TCP has no HTTP boundary to measure bytes at, same as a local
+        // remote; the ref updates are still real.
         report_fetch(&reporter, &outcome, 0);
         return Ok(FetchResult::from_outcome(&outcome));
     }
