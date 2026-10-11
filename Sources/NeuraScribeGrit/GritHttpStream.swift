@@ -23,6 +23,23 @@ final class GritHttpStreamBody: NSObject, URLSessionDataDelegate, @unchecked Sen
     /// Long enough to cover a server generating a pack without sending a byte,
     /// short enough that a dead connection surfaces while someone can still see it.
     private static let readStallSeconds: TimeInterval = 300
+    /// How far URLSession may run ahead of grit before the task is paused.
+    ///
+    /// `pending` is the one place a body can still accumulate, and nothing
+    /// upstream bounds it on its own: URLSession keeps delivering while grit is
+    /// busy, and grit's consumer is far slower than the network (it hashes and
+    /// indexes the pack as it goes, and older paths inflated every object into
+    /// its own loose file). Without a ceiling a large pack ends up resident here
+    /// in full -- the way a pull of a real repository was killed by the iOS
+    /// per-process limit even after the body stopped being collected up front.
+    /// Suspending the task stops the read at the socket, so the server (and TCP)
+    /// throttle the transfer instead of this process's memory.
+    private static let highWaterMark = 8 * 1024 * 1024
+    /// How far the buffer must drain before the task is allowed to run again.
+    private static let lowWaterMark = 2 * 1024 * 1024
+    /// Whether the task is suspended by the water marks. The flag keeps suspend
+    /// and resume paired, since suspension counts are not idempotent.
+    private var suspended = false
     private var pending = Data()
     private var finished = false
     private var failureBytes: [CChar] = []
@@ -130,6 +147,11 @@ final class GritHttpStreamBody: NSObject, URLSessionDataDelegate, @unchecked Sen
             pending.copyBytes(to: buf.assumingMemoryBound(to: UInt8.self), count: count)
             pending.removeFirst(count)
             received += count
+            // Let the network run again once the reader has caught up.
+            if suspended, pending.count <= Self.lowWaterMark {
+                suspended = false
+                task?.resume()
+            }
         }
         return count
     }
@@ -172,6 +194,13 @@ final class GritHttpStreamBody: NSObject, URLSessionDataDelegate, @unchecked Sen
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         condition.lock()
         pending.append(data)
+        // Stop the transfer from outrunning the reader. `suspend` takes effect
+        // asynchronously, so a little more may still land; the mark bounds the
+        // backlog, it is not a hard limit on a single delivery.
+        if !suspended, pending.count >= Self.highWaterMark {
+            suspended = true
+            dataTask.suspend()
+        }
         condition.broadcast()
         condition.unlock()
     }
