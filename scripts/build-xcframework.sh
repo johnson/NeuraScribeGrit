@@ -11,9 +11,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export CARGO_INCREMENTAL=0
-# The target directory lives off the repo so ExFAT's lack of hardlinks does not
-# slow the build down, and so a clean is a plain rm -rf.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/Store2T/.nsg-target}"
+# Keep the target directory off the repository: a clean is then a plain rm -rf,
+# and on a data volume (where this project's machines keep their sources) cargo's
+# hardlink-heavy target directory does not have to cope with ExFAT. The default
+# is under $HOME so it works on any machine; override it when you have somewhere
+# better (the machines that build this on a fast volume set this to a data-disk
+# path).
+if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+  export CARGO_TARGET_DIR="$HOME/.cache/neurascribe-grit-target"
+fi
 
 OUT=neurascribe_gritFFI.xcframework
 STAGE=$(mktemp -d)
