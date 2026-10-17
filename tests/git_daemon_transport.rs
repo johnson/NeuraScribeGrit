@@ -1,11 +1,12 @@
-//! A git:// remote must be fetched over the native daemon transport, not the
-//! HTTP bridge.
+//! A git:// remote must be fetched and pushed over the native daemon transport,
+//! not the HTTP bridge.
 //!
 //! The Swift side answers HTTP with URLSession, which has no handler for the
 //! git scheme -- routing a git:// URL there fails before a byte moves. grit
-//! ships GitDaemonTransport (raw TCP), and these tests pin that the fetch
-//! dispatch takes it, against a real git-daemon process (interop with the
-//! real server, not grit's own).
+//! ships GitDaemonTransport (raw TCP), and these tests pin that the fetch and
+//! push dispatches take it, against a real git-daemon process (interop with
+//! the real server, not grit's own). Push additionally requires the daemon to
+//! be started with --enable=receive-pack.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -71,6 +72,7 @@ impl Daemon {
             .args([
                 "daemon",
                 "--reuseaddr",
+                "--enable=receive-pack",
                 &format!("--base-path={}", base.display()),
                 "--listen=127.0.0.1",
                 &format!("--port={port}"),
@@ -136,4 +138,88 @@ fn git_scheme_fetches_without_the_http_bridge() {
     assert_eq!(kind, "commit", "the fetched pack must be ingested, not just refs moved");
     let subject = git(&dir.path().join("local"), &["log", "--format=%s", "-1", &remote_main]);
     assert_eq!(subject, "seed");
+}
+
+#[test]
+fn local_path_push_writes_the_remote_repository() {
+    let dir = tempfile::tempdir().expect("temp");
+    let remote_path = remote(dir.path());
+    let local = dir.path().join("local");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            remote_path.to_str().expect("utf8"),
+            local.to_str().expect("utf8"),
+        ],
+    );
+    std::fs::write(local.join("local.md"), "local\n").expect("write local");
+    git(&local, &["add", "."]);
+    git(
+        &local,
+        &["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-m", "local"],
+    );
+    let local_main = git(&local, &["rev-parse", "main"]);
+
+    let result = net::push(
+        &local.join(".git"),
+        remote_path.to_str().expect("utf8"),
+        "main",
+        false,
+        None,
+        no_http(),
+        no_progress(),
+    )
+    .expect("a local path push must write the remote directly");
+
+    assert_eq!(result.refs.len(), 1, "one branch was pushed");
+    assert_eq!(result.refs[0].status, "ok", "local verdict: {:?}", result.refs[0]);
+    let remote_main = git(&remote_path, &["rev-parse", "main"]);
+    assert_eq!(remote_main, local_main, "the local remote branch must advance");
+}
+
+#[test]
+fn git_scheme_pushes_over_receive_pack() {
+    let dir = tempfile::tempdir().expect("temp");
+    let remote_path = remote(dir.path());
+    let port = free_port();
+    let _daemon = Daemon::start(&dir.path().join("srv"), port);
+
+    // Start from the remote's commit so the push is a fast-forward.
+    let local = dir.path().join("local");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            remote_path.to_str().expect("utf8"),
+            local.to_str().expect("utf8"),
+        ],
+    );
+    std::fs::write(local.join("local.md"), "local\n").expect("write local");
+    git(&local, &["add", "."]);
+    git(
+        &local,
+        &["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-m", "local"],
+    );
+    let local_main = git(&local, &["rev-parse", "main"]);
+
+    let url = format!("git://127.0.0.1:{port}/remote.git");
+    let result = net::push(
+        &local.join(".git"),
+        &url,
+        "main",
+        false,
+        None,
+        no_http(),
+        no_progress(),
+    )
+    .expect("a git:// push must not need the HTTP bridge");
+
+    assert_eq!(result.refs.len(), 1, "one branch was pushed");
+    assert_eq!(result.refs[0].status, "ok", "server verdict: {:?}", result.refs[0]);
+    let remote_main = git(&remote_path, &["rev-parse", "main"]);
+    assert_eq!(
+        remote_main, local_main,
+        "the remote branch must advance to the pushed commit"
+    );
 }

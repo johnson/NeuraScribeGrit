@@ -1,12 +1,13 @@
 //! Network operations: clone, fetch and push over smart HTTP, the native
-//! git daemon protocol (fetch only), and local directories.
+//! git daemon protocol, and local directories.
 //!
 //! The HTTP operations run on grit's own protocol implementations -- `http_fetch`
 //! and `push_http` do the full smart-HTTP dance, and clone is init + fetch +
-//! checkout. git:// fetches go through grit's `GitDaemonTransport` (raw TCP,
-//! no HTTP bridge involved). The only things this module supplies are grit's
-//! `HttpClient`, the credential, and turning the results into the shapes the
-//! Swift side already knows from the gix backend.
+//! checkout. git:// operations go through grit's `GitDaemonTransport` (raw TCP,
+//! no HTTP bridge involved): `UploadPack` for fetch, `ReceivePack` for push.
+//! Local remotes use `fetch_local` / `push_local`, not the HTTP bridge either.
+//! The only things this module supplies are grit's `HttpClient`, the credential,
+//! and turning the results into the shapes the Swift side already knows.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -291,9 +292,10 @@ pub fn clone(
 
 /// Push local `branch` to `refs/heads/branch` on `url`.
 ///
-/// `force` maps to git's `+` refspec. Everything else -- the advertisement,
-/// the ref decision, the pack, and reading back the server's verdict -- is
-/// grit's `push_http`.
+/// `force` maps to git's `+` refspec. The transport is chosen from the URL:
+/// a local directory uses grit's `push_local`; `git://` uses
+/// `GitDaemonTransport` + `push_remote` (the daemon must be started with
+/// `--enable=receive-pack`); everything else uses smart HTTP `push_http`.
 pub fn push(
     git_dir: &Path,
     url: &str,
@@ -328,6 +330,41 @@ pub fn push(
     reporter.push_negotiation(&local_ref, &src.to_hex());
     reporter.pack(0);
 
+    // A local directory is the same device: write objects and refs directly.
+    if let Some(remote_git_dir) = local_remote_path(url) {
+        let outcome = grit_lib::transfer::push_local(git_dir, &remote_git_dir, &refs, &opts)
+            .with_context(|| format!("push to {} failed", remote_git_dir.display()))?;
+        return finish_push(outcome, &reporter, None);
+    }
+
+    // git:// is raw TCP -- URLSession cannot carry it, and it is the natural
+    // LAN transport. The daemon must be started with --enable=receive-pack;
+    // without it the connection is accepted and immediately dropped.
+    if url.trim_start().starts_with("git://") {
+        let transport = grit_lib::transport::GitDaemonTransport::new();
+        let mut conn = transport
+            .connect(
+                url.trim(),
+                grit_lib::transport::Service::ReceivePack,
+                &grit_lib::transport::ConnectOptions::default(),
+            )
+            .with_context(|| {
+                format!(
+                    "connect to {url} failed (is the git daemon running with --enable=receive-pack?)"
+                )
+            })?;
+        let mut bridge = ProgressBridge::new(progress);
+        let outcome = grit_lib::push::push_remote(
+            git_dir,
+            conn.as_mut(),
+            &refs,
+            &opts,
+            &mut bridge,
+        )
+        .with_context(|| format!("push to {url} failed"))?;
+        return finish_push(outcome, &reporter, None);
+    }
+
     let counters = Arc::new(ByteCounters::default());
     let client = http::client_for(cred, callbacks, counters.clone())?;
     let mut bridge = ProgressBridge::new(progress);
@@ -342,8 +379,23 @@ pub fn push(
         &mut bridge,
     )
     .with_context(|| format!("push to {base} failed"))?;
+    finish_push(outcome, &reporter, Some(counters.sent()))
+}
+
+/// Map grit's push outcome to the Swift-facing shape and announce each ref.
+///
+/// `sent_bytes` is `None` for a local path or raw git:// TCP: neither has an
+/// HTTP boundary whose byte count is meaningful, so we omit the transfer
+/// number instead of reporting a fake 0.
+fn finish_push(
+    outcome: grit_lib::transfer::PushOutcome,
+    reporter: &ProgressReporter,
+    sent_bytes: Option<u64>,
+) -> Result<PushResult> {
     reporter.pack(1);
-    reporter.push_transfer(counters.sent());
+    if let Some(bytes) = sent_bytes {
+        reporter.push_transfer(bytes);
+    }
 
     let mut pushed = Vec::new();
     for result in &outcome.results {
