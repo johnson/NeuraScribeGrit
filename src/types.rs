@@ -40,8 +40,17 @@ pub struct StatusResult {
 pub struct FileDiff {
     pub path: String,
     /// Unified diff body. Empty string when the change has no textual content
-    /// (e.g. a pure mode change).
+    /// (e.g. a pure mode change, or a file flagged `binary`).
     pub patch: String,
+    /// The file is binary (a NUL byte, or a high non-text ratio, in the first
+    /// 8 KiB) or larger than the diff size cap, so `patch` is empty and the
+    /// caller should show a placeholder instead of a diff.
+    ///
+    /// `#[serde(default)]` keeps JSON produced by older builds decodable: a
+    /// missing field reads as `false`, which is exactly what older builds
+    /// meant (they never flagged anything).
+    #[serde(default)]
+    pub binary: bool,
 }
 
 /// A configured remote.

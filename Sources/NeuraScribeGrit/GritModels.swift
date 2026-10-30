@@ -48,12 +48,33 @@ public struct GritStatus: Codable, Hashable, Sendable {
 public struct GritFileDiff: Codable, Hashable, Sendable {
     public let path: String
     /// The unified-diff body. Empty for changes with no textual content, such
-    /// as a pure permission change.
+    /// as a pure permission change or a file flagged `binary`.
     public let patch: String
+    /// The file is binary (a NUL byte, or a high non-text ratio, in its first
+    /// 8 KiB) or larger than the Rust side's diff size cap, so `patch` is
+    /// empty and the caller should show a placeholder instead of a diff.
+    public let binary: Bool
 
-    public init(path: String, patch: String) {
+    public init(path: String, patch: String, binary: Bool = false) {
         self.path = path
         self.patch = patch
+        self.binary = binary
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case path
+        case patch
+        case binary
+    }
+
+    /// `binary` decodes with a default: JSON produced by an older build
+    /// carries no such key, and the synthesized decoder would otherwise throw
+    /// on it and lose the whole commit diff.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        patch = try container.decode(String.self, forKey: .patch)
+        binary = try container.decodeIfPresent(Bool.self, forKey: .binary) ?? false
     }
 }
 

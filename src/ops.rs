@@ -280,18 +280,25 @@ pub fn commit_only(
 }
 
 /// Unified diff of one file between HEAD and the work tree.
+///
+/// Both sides pass through the same binary/oversize guard as the commit diff:
+/// either side that is binary or over the size cap yields an **empty string**
+/// (not an error) — the Swift side (`GitService.diff`) already interprets an
+/// empty result as "no textual change, nothing to show".
 pub fn diff_file(repo: &Repository, path: &str) -> Result<String> {
     let work_tree = repo.work_tree.as_deref().context("bare repository has no work tree")?;
     let full = work_tree.join(path);
 
-    let old = match blob_at_head(repo, path)? {
-        Some(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+    let old = match head_blob_oid(repo, path)? {
+        Some(oid) => match blob_text_for_diff(repo, &oid) {
+            Some(text) => text,
+            None => return Ok(String::new()),
+        },
         None => String::new(),
     };
-    let new = if full.is_file() {
-        String::from_utf8_lossy(&fs::read(&full)?).to_string()
-    } else {
-        String::new()
+    let new = match worktree_text_for_diff(&full) {
+        Some(text) => text,
+        None => return Ok(String::new()),
     };
 
     let old_path = if old.is_empty() { "/dev/null" } else { path };
@@ -892,7 +899,101 @@ pub(crate) fn index_paths(index: &Index) -> BTreeSet<String> {
     index.entries.iter().map(|e| String::from_utf8_lossy(&e.path).to_string()).collect()
 }
 
+/// Maximum total size of a blob that diff will turn into text.
+///
+/// Beyond this, the file is treated as binary and gets no patch: a histogram
+/// diff over several megabytes of text can stall the process for minutes — on
+/// a phone that is indistinguishable from a freeze, and a 2 MiB patch is not
+/// something anyone reads in a sheet anyway.
+const DIFF_SIZE_CAP: usize = 2 * 1024 * 1024;
+
+/// How much of a blob's head to sniff when classifying it as binary.
+///
+/// Git's own binary detection scans roughly 8000 bytes; 8 KiB is the same
+/// order, aligned to a page boundary for no particular reason but tidiness.
+const DIFF_SNIFF_BYTES: usize = 8192;
+
+/// Whether a byte head should be classified as binary.
+///
+/// NUL-only, exactly like git's `buffer_is_binary`. The earlier 30%
+/// "non-text byte" ratio rule seemed conservative but misclassified every
+/// UTF-8 CJK document — a Chinese character is three bytes all >= 0x80, so a
+/// mostly-Chinese markdown file measured ~60% "non-text" and lost its diff
+/// (field report 2026-10-30: plain-text .md edits showing "Binary file not
+/// shown"). High bytes are not evidence of binary; NUL is. UTF-16 without a
+/// BOM still gets caught, because its ASCII range leaves NUL bytes at odd
+/// offsets.
+fn is_binary_head(head: &[u8]) -> bool {
+    head.contains(&0)
+}
+
+/// Turn a blob into diffable text; `None` for a binary or oversize blob.
+///
+/// - `None` means "do not generate a patch": the caller emits an empty patch
+///   with the `binary` flag set, which the app renders as a placeholder.
+/// - A zero oid (the added or deleted side) is empty text, preserving the
+///   previous behaviour.
+/// - A non-blob object (a submodule pointer) or an unreadable object reads as
+///   empty text: the old code produced no patch for either, and neither case
+///   is binary, so it must not take the `binary` flag.
+fn blob_text_for_diff(repo: &Repository, oid: &ObjectId) -> Option<String> {
+    if *oid == zero_oid() {
+        return Some(String::new());
+    }
+    let object = repo.odb.read(oid).ok()?;
+    if object.kind != ObjectKind::Blob {
+        return Some(String::new());
+    }
+    if object.data.len() > DIFF_SIZE_CAP {
+        return None;
+    }
+    let head = &object.data[..object.data.len().min(DIFF_SNIFF_BYTES)];
+    if is_binary_head(head) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&object.data).to_string())
+}
+
+/// Read a work-tree file as diff text, sniffing its head before reading in.
+///
+/// The size comes from the metadata and the classification from the first
+/// `DIFF_SNIFF_BYTES`, so an oversize file is rejected without its body ever
+/// reaching memory; a file within the cap is read whole (the cap bounds it).
+/// A missing file is empty text (the deleted side), as before.
+fn worktree_text_for_diff(full: &Path) -> Option<String> {
+    use std::io::Read;
+
+    if !full.is_file() {
+        return Some(String::new());
+    }
+    let mut file = fs::File::open(full).ok()?;
+    let total = file.metadata().ok()?.len() as usize;
+    if total > DIFF_SIZE_CAP {
+        return None;
+    }
+    // Streaming head sniff: read the first 8 KiB (or all, for small files)
+    // and classify before the rest of the file is read in.
+    let mut data = vec![0u8; total.min(DIFF_SNIFF_BYTES)];
+    if total > 0 && file.read_exact(&mut data).is_err() {
+        return None; // the file shrank or vanished mid-read
+    }
+    if is_binary_head(&data) {
+        return None;
+    }
+    data.reserve(total - data.len());
+    if file.read_to_end(&mut data).is_err() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&data).to_string())
+}
+
 /// Build unified patches for every changed file between two trees.
+///
+/// Every blob passes through [`blob_text_for_diff`] before it is diffed. A
+/// binary or oversize side short-circuits to an empty patch flagged `binary`
+/// instead of feeding the histogram with a lossy-UTF8 rendering of the whole
+/// blob — which is what froze the app (and once ended the process) on any
+/// commit that touched an image or a video.
 fn patch_entries(
     repo: &Repository,
     old_tree: Option<&ObjectId>,
@@ -902,26 +1003,28 @@ fn patch_entries(
     let mut out = Vec::new();
     for entry in &entries {
         let path = entry.path().to_string();
-        let old_text = read_blob_text(repo, &entry.old_oid);
-        let new_text = read_blob_text(repo, &entry.new_oid);
-        let old_path = if entry.old_oid == zero_oid() { "/dev/null" } else { path.as_str() };
-        let new_path = if entry.new_oid == zero_oid() { "/dev/null" } else { path.as_str() };
-        let patch = unified_diff_histogram_with_prefix_and_funcname(
-            &old_text, &new_text, old_path, new_path, 3, 0, "a/", "b/", None, false,
-        );
-        out.push(FileDiff { path, patch });
+        let old_text = blob_text_for_diff(repo, &entry.old_oid);
+        let new_text = blob_text_for_diff(repo, &entry.new_oid);
+        let (patch, binary) = match (old_text, new_text) {
+            // Both sides are diffable text (a zero oid is empty text). A pure
+            // permission change lands here with unchanged text and produces
+            // the empty patch it always did, still `binary: false`.
+            (Some(old), Some(new)) => {
+                let old_path = if entry.old_oid == zero_oid() { "/dev/null" } else { path.as_str() };
+                let new_path = if entry.new_oid == zero_oid() { "/dev/null" } else { path.as_str() };
+                (
+                    unified_diff_histogram_with_prefix_and_funcname(
+                        &old, &new, old_path, new_path, 3, 0, "a/", "b/", None, false,
+                    ),
+                    false,
+                )
+            }
+            // Either side is binary or oversize: no patch, flag it.
+            _ => (String::new(), true),
+        };
+        out.push(FileDiff { path, patch, binary });
     }
     Ok(out)
-}
-
-fn read_blob_text(repo: &Repository, oid: &ObjectId) -> String {
-    if *oid == zero_oid() {
-        return String::new();
-    }
-    match repo.odb.read(oid) {
-        Ok(o) if o.kind == ObjectKind::Blob => String::from_utf8_lossy(&o.data).to_string(),
-        _ => String::new(),
-    }
 }
 
 fn zero_oid() -> ObjectId {
@@ -1252,14 +1355,16 @@ pub(crate) fn parent_of(repo: &Repository, oid: &ObjectId) -> Result<Option<Obje
     Ok(parse_commit(&object.data)?.parents.first().copied())
 }
 
-pub(crate) fn blob_at_head(repo: &Repository, path: &str) -> Result<Option<Vec<u8>>> {
+/// The oid `path` records at HEAD, `None` when the path is not in HEAD.
+///
+/// Kept at the oid level (rather than the old byte-level read) so the
+/// binary/oversize guard in [`blob_text_for_diff`] can classify the blob
+/// before any lossy conversion happens.
+pub(crate) fn head_blob_oid(repo: &Repository, path: &str) -> Result<Option<ObjectId>> {
     let Some(sha) = head_sha(repo) else { return Ok(None) };
     let tree = commit_tree(repo, &sha)?;
     let entries = flatten_tree(&repo.odb, tree)?;
-    let Some((_, _, oid)) = entries.iter().find(|(rel, _, _)| rel == path) else {
-        return Ok(None);
-    };
-    Ok(Some(repo.odb.read(oid)?.data))
+    Ok(entries.iter().find(|(rel, _, _)| rel == path).map(|(_, _, oid)| *oid))
 }
 
 /// Flatten a tree into (relative path, mode, oid), depth first, sorted by path.
