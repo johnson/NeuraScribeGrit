@@ -868,6 +868,9 @@ pub extern "C" fn grit_clone(
 }
 
 /// Fetch into an already-open repository. Returns fetch JSON, or NULL.
+///
+/// `refetch` (0/1) re-downloads everything the requested refs reach, as if the
+/// local repository held nothing — the repair for a damaged object store.
 #[no_mangle]
 pub extern "C" fn grit_repo_fetch_json(
     repo: *mut Repository,
@@ -876,6 +879,7 @@ pub extern "C" fn grit_repo_fetch_json(
     credential: *const c_char,
     http: *const crate::http::HttpCallbacks,
     progress: *const crate::progress::ProgressCallbacks,
+    refetch: i32,
 ) -> *mut c_char {
     if repo.is_null() {
         set_error("null repo");
@@ -905,6 +909,7 @@ pub extern "C" fn grit_repo_fetch_json(
             credential.as_ref(),
             unsafe { take_callbacks(http) },
             unsafe { take_progress(progress) },
+            refetch != 0,
         )?;
         serde_json::to_value(result).map_err(anyhow::Error::from)
     })

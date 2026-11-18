@@ -76,7 +76,7 @@ pub fn http_base_url(url: &str) -> String {
     base
 }
 
-fn fetch_options(refspecs: Vec<String>) -> FetchOptions {
+fn fetch_options(refspecs: Vec<String>, refetch: bool) -> FetchOptions {
     FetchOptions {
         refspecs,
         negative_refspecs: Vec::new(),
@@ -88,6 +88,7 @@ fn fetch_options(refspecs: Vec<String>) -> FetchOptions {
         deepen_since: None,
         deepen_not: Vec::new(),
         unshallow: false,
+        refetch,
     }
 }
 
@@ -167,6 +168,13 @@ fn report_fetch(reporter: &ProgressReporter, outcome: &FetchOutcome, received_by
 }
 
 /// Fetch from `url` into the repository whose git dir is `git_dir`.
+///
+/// `refetch` re-downloads everything the requested refs reach, as if the local
+/// repository held nothing: the client offers no `have`s and the wanted tips
+/// are requested even when the local index still claims them. That is the
+/// repair for a damaged object store — a truncated pack (or a stale
+/// multi-pack index pointing at one) keeps `exists` true while the data is
+/// gone, so a normal fetch transfers nothing and the damage stays.
 pub fn fetch(
     git_dir: &Path,
     url: &str,
@@ -174,6 +182,7 @@ pub fn fetch(
     cred: Option<&Credential>,
     callbacks: http::HttpCallbacks,
     progress: ProgressCallbacks,
+    refetch: bool,
 ) -> Result<FetchResult> {
     // A local remote must not go through the HTTP bridge. URLSession has no
     // file:// transport, so the request fails before it starts; and even if
@@ -185,7 +194,7 @@ pub fn fetch(
         let outcome = grit_lib::transfer::fetch_local(
             git_dir,
             &remote_git_dir,
-            &fetch_options(refspecs.to_vec()),
+            &fetch_options(refspecs.to_vec(), refetch),
         )
         .with_context(|| format!("fetch from {} failed", remote_git_dir.display()))?;
         // No HTTP boundary, so no byte total to report; the ref updates
@@ -212,7 +221,7 @@ pub fn fetch(
         let outcome = grit_lib::fetch::fetch_remote(
             git_dir,
             conn.as_mut(),
-            &fetch_options(refspecs.to_vec()),
+            &fetch_options(refspecs.to_vec(), refetch),
             &mut bridge,
         )
         .with_context(|| format!("fetch from {url} failed"))?;
@@ -230,7 +239,7 @@ pub fn fetch(
         client.as_ref(),
         git_dir,
         &base,
-        &fetch_options(refspecs.to_vec()),
+        &fetch_options(refspecs.to_vec(), refetch),
         &mut bridge,
     )
     .with_context(|| format!("fetch from {base} failed"))?;
@@ -268,12 +277,13 @@ pub fn clone(
     // grit's fetch has no "fetch everything" mode -- an empty refspec list
     // writes nothing -- so the remote-tracking namespace is populated first
     // and the branch is created from it afterwards. `git clone` orders it
-    // the same way.
+    // the same way. A clone starts from an empty store, so there is nothing to
+    // refetch: the full closure is wanted regardless.
     let outcome = grit_lib::transport::http::http_fetch(
         client.as_ref(),
         &repo.git_dir,
         &base,
-        &fetch_options(vec![format!("+refs/heads/*:{TRACKING_PREFIX}*")]),
+        &fetch_options(vec![format!("+refs/heads/*:{TRACKING_PREFIX}*")], false),
         &mut bridge,
     )
     .with_context(|| format!("clone from {base} failed"))?;

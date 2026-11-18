@@ -22,8 +22,9 @@ http-ureq = ["grit-lib/http-ureq"]
 # validated against. a6828d5b carries the config backslash-escape fix, without which a
 # ~/.gitconfig using git's own opendiff idiom fails every config read — see
 # grit-lib/tests/config_escapes.rs. grit-git is GPL-2.0 and is deliberately NOT
-# depended on.
-grit-lib = { git = "https://github.com/johnson/grit", rev = "a6828d5b0512bc8304647632090b90ecea7524bb" }
+# depended on. a81f6b1d adds FetchOptions.refetch (repair for a damaged object
+# store) on top of it.
+grit-lib = { git = "https://github.com/johnson/grit", rev = "a81f6b1dab1475da882985fafe5bd5c61863e01c" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

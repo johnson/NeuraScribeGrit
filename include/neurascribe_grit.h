@@ -294,8 +294,10 @@ char *grit_repo_work_tree(GritRepoHandle *repo);
  * `http` carries the URLSession bridge for this call; see GritHttpCallbacks. */
 char *grit_clone(const char *url, const char *dest, const char *branch, const char *credential, const GritHttpCallbacks *http,
                             const GritProgressCallbacks *progress);
+/* refetch (0/1): re-download everything the requested refs reach, as if the
+ * local repository held nothing — the repair for a damaged object store. */
 char *grit_repo_fetch_json(GritRepoHandle *repo, const char *url, const char *refspecs_json, const char *credential, const GritHttpCallbacks *http,
-                            const GritProgressCallbacks *progress);
+                            const GritProgressCallbacks *progress, int32_t refetch);
 char *grit_repo_push_json(GritRepoHandle *repo, const char *url, const char *branch, int32_t force, const char *credential, const GritHttpCallbacks *http,
                             const GritProgressCallbacks *progress);
 

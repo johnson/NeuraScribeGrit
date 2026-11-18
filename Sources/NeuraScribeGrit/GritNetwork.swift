@@ -102,13 +102,20 @@ public enum GritNetwork {
     /// - Parameter refspecs: for example `["+refs/heads/*:refs/remotes/origin/*"]`.
     ///   grit has no "an empty refspec means everything" mode, so the wildcard
     ///   has to be spelled out; an empty list fetches nothing at all.
+    /// - Parameter refetch: when true, re-download everything the requested
+    ///   refs reach, as if the repository held nothing. A normal fetch offers
+    ///   the local ref tips as `have`s, so a damaged object store — a truncated
+    ///   pack whose index (or multi-pack index) still lists its objects — is
+    ///   considered complete and nothing is transferred; a refetch lands a
+    ///   fresh, intact copy of everything the remote has.
     public static func fetch(
         repository: GritRepository,
         url: String,
         refspecs: [String],
         credential: GritCredential? = nil,
         http: GritHttpBridge = GritHttpBridge(),
-        progress: GritProgressBridge = .silent
+        progress: GritProgressBridge = .silent,
+        refetch: Bool = false
     ) throws -> GritFetchResult {
         let encoded = (try? String(decoding: JSONEncoder().encode(refspecs), as: UTF8.self)) ?? "[]"
         let raw = GritProgressBridge.withRegistration(progress) { progressCallbacks in
@@ -119,7 +126,8 @@ public enum GritNetwork {
                             withUnsafePointer(to: http.callbacks) { callbacks in
                                 grit_repo_fetch_json(
                                     repository.rawHandle, urlPointer, refspecPointer,
-                                    credentialPointer, callbacks, progress
+                                    credentialPointer, callbacks, progress,
+                                    refetch ? 1 : 0
                                 )
                             }
                         }
